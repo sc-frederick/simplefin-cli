@@ -4,6 +4,8 @@
 
 Read-only access to your bank, card and loan accounts through [SimpleFIN Bridge](https://bridge.simplefin.org), as a CLI and an MCP server for agents.
 
+> **This fork** adds [`worker/`](worker/README.md): the same sync and tools as a Cloudflare Worker with a SQLite Durable Object, served privately to [Executor](https://executor.sh) behind Cloudflare Access. It syncs on alarms with no local process. See its [security model](worker/docs/security.md).
+
 Data is synced into a local SQLite database, and every query reads that copy. Syncing happens automatically (see [Auto-sync](#auto-sync)), within SimpleFIN's limit of about 24 requests a day; it disables access tokens that keep going over. Works on macOS, Linux and Windows.
 
 ## Setup
