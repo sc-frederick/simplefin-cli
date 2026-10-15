@@ -116,6 +116,32 @@ const decodeTransaction = Schema.decodeUnknownResult(TransactionResponse);
 const decodeError = Schema.decodeUnknownResult(ErrorResponse);
 const decodeMessage = Schema.decodeUnknownResult(Schema.String);
 
+/** 2100-01-01. Timestamps outside 1970–2100 are corrupt and would break date rendering. */
+const MAX_TIMESTAMP = 4_102_444_800;
+
+/** A timestamp within 1970–2100, truncated to whole seconds, or undefined. */
+function timestamp(value: number | null | undefined): number | undefined {
+  return value === null || value === undefined || value < 0 || value > MAX_TIMESTAMP
+    ? undefined
+    : Math.trunc(value);
+}
+
+/** Ids are shown to agents too, so they get the same cleaning as text; empty means unusable. */
+function identifier(value: string): string | undefined {
+  const clean = sanitizeText(value, 256);
+
+  return clean === "" ? undefined : clean;
+}
+
+/** A balance as a canonical decimal string, or null when absent or not a decimal amount. */
+function decimal(value: string | number | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+
+  const text = String(value).trim();
+
+  return Result.isSuccess(parseAmountCents(text)) ? text : null;
+}
+
 function bounded(text: string | null | undefined, maxLength: number): string | null {
   const visible = sanitizeOptionalText(text);
 
@@ -149,8 +175,11 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
 
     if (code.startsWith("act.") || code.startsWith("con.")) hasDataErrors = true;
 
-    if (code.startsWith("act.") && error.account_id) accountsWithErrors.add(error.account_id);
-    else if (code.startsWith("con.") && error.conn_id) connectionsWithErrors.add(error.conn_id);
+    const accountId = error.account_id ? identifier(error.account_id) : undefined;
+    const connId = error.conn_id ? identifier(error.conn_id) : undefined;
+
+    if (code.startsWith("act.") && accountId !== undefined) accountsWithErrors.add(accountId);
+    else if (code.startsWith("con.") && connId !== undefined) connectionsWithErrors.add(connId);
 
     const message = sanitizeText(error.msg || error.code || "Unspecified Bridge error");
 
@@ -170,10 +199,12 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
   for (const raw of envelope.success.connections ?? []) {
     const decoded = decodeConnection(raw);
 
-    if (Result.isFailure(decoded)) continue;
+    const connId = Result.isSuccess(decoded) ? identifier(decoded.success.conn_id) : undefined;
+
+    if (Result.isFailure(decoded) || connId === undefined) continue;
 
     connections.push({
-      connId: decoded.success.conn_id,
+      connId,
       name: bounded(decoded.success.name, 200),
       orgId: bounded(decoded.success.org_id, 200),
       orgName: bounded(decoded.success.org_name, 200),
@@ -186,7 +217,9 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
   for (const raw of envelope.success.accounts ?? []) {
     const decoded = decodeAccount(raw);
 
-    if (Result.isFailure(decoded)) {
+    const accountId = Result.isSuccess(decoded) ? identifier(decoded.success.id) : undefined;
+
+    if (Result.isFailure(decoded) || accountId === undefined) {
       skippedAccounts += 1;
       continue;
     }
@@ -204,7 +237,19 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
           ? parseAmountCents(String(transaction.success.amount))
           : undefined;
 
-        if (Result.isFailure(transaction) || cents === undefined || Result.isFailure(cents)) {
+        const id = Result.isSuccess(transaction) ? identifier(transaction.success.id) : undefined;
+
+        const posted = Result.isSuccess(transaction)
+          ? timestamp(transaction.success.posted ?? 0)
+          : undefined;
+
+        if (
+          Result.isFailure(transaction) ||
+          cents === undefined ||
+          Result.isFailure(cents) ||
+          id === undefined ||
+          posted === undefined
+        ) {
           skippedTransactions += 1;
           continue;
         }
@@ -212,12 +257,9 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
         const value = transaction.success;
 
         transactions.push({
-          id: value.id,
-          posted: Math.trunc(value.posted ?? 0),
-          transactedAt:
-            value.transacted_at === undefined || value.transacted_at === null
-              ? null
-              : Math.trunc(value.transacted_at),
+          id,
+          posted,
+          transactedAt: timestamp(value.transacted_at) ?? null,
           amount: String(value.amount),
           amountCents: cents.success,
           description: bounded(value.description, 500) ?? "",
@@ -229,20 +271,13 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
     }
 
     accounts.push({
-      id: account.id,
-      connId: account.conn_id ?? account.org?.id ?? null,
-      name: bounded(account.name, 200) ?? account.id,
+      id: accountId,
+      connId: identifier(account.conn_id ?? account.org?.id ?? "") ?? null,
+      name: bounded(account.name, 200) ?? accountId,
       currency: bounded(account.currency, 40),
-      balance:
-        account.balance === undefined || account.balance === null ? null : String(account.balance),
-      availableBalance:
-        account["available-balance"] === undefined || account["available-balance"] === null
-          ? null
-          : String(account["available-balance"]),
-      balanceDate:
-        account["balance-date"] === undefined || account["balance-date"] === null
-          ? null
-          : Math.trunc(account["balance-date"]),
+      balance: decimal(account.balance),
+      availableBalance: decimal(account["available-balance"]),
+      balanceDate: timestamp(account["balance-date"]) ?? null,
       transactions,
     });
   }

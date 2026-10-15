@@ -15,7 +15,7 @@
  * printed, logged, or written to disk.
  */
 import { Effect, Exit, Redacted, Result, Schema } from "effect";
-import { ACCESS_URL_SECRET_NAME } from "../src/deployment.ts";
+import { ACCESS_URL_PLACEHOLDER, ACCESS_URL_SECRET_NAME } from "../src/deployment.ts";
 import { claimAccessUrl } from "../src/simplefin/bridge-client.ts";
 import { decodeSetupToken } from "../src/simplefin/credentials.ts";
 
@@ -26,13 +26,27 @@ const ApiEnvelope = <S extends Schema.Top>(result: S) =>
     success: Schema.Boolean,
     errors: Schema.Array(Schema.Struct({ code: Schema.Number, message: Schema.String })),
     result: Schema.NullOr(result),
+    result_info: Schema.optionalKey(Schema.Struct({ total_pages: Schema.optionalKey(Schema.Int) })),
   });
 
 const Stores = ApiEnvelope(Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String })));
 
-const Secrets = ApiEnvelope(
-  Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String })),
-);
+const Secret = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  comment: Schema.optionalKey(Schema.NullOr(Schema.String)),
+});
+
+const Secrets = ApiEnvelope(Schema.Array(Secret));
+
+const PENDING_COMMENT = "SimpleFIN access URL for the simplefin-bridge Worker: claim pending.";
+
+const CLAIMED_COMMENT =
+  "SimpleFIN access URL for the simplefin-bridge Worker. Written by scripts/claim.ts.";
+
+const DISABLE_ADVICE =
+  "The setup token was spent, but the access URL could not be stored and has been discarded. " +
+  "Disable this app's connection at https://bridge.simplefin.org, create a new setup token, and run the claim again.";
 
 const Anything = ApiEnvelope(Schema.Unknown);
 
@@ -44,7 +58,7 @@ type SecretsRequest =
       readonly scopes: ReadonlyArray<"workers">;
       readonly comment: string;
     }>
-  | { readonly value: string };
+  | { readonly value?: string; readonly comment: string };
 
 /** A failure safe to print: it never contains a token, URL credential, or response body. */
 class ClaimStopped extends Error {}
@@ -58,6 +72,15 @@ function readHidden(prompt: string): Promise<string> {
     );
   }
 
+  // Leave the terminal usable even if the process is stopped mid-prompt.
+  const restore = () => input.setRawMode(false);
+
+  process.once("exit", restore);
+  process.once("SIGTERM", () => {
+    restore();
+    process.exit(143);
+  });
+
   process.stdout.write(prompt);
   input.setRawMode(true);
   input.resume();
@@ -67,7 +90,7 @@ function readHidden(prompt: string): Promise<string> {
     let value = "";
 
     const finish = (outcome: () => void) => {
-      input.setRawMode(false);
+      restore();
       input.pause();
       input.removeListener("data", onData);
       process.stdout.write("\n");
@@ -81,7 +104,8 @@ function readHidden(prompt: string): Promise<string> {
         if (character === "\u0003") return finish(() => reject(new ClaimStopped("Cancelled.")));
 
         if (character === "\u007f" || character === "\b") value = value.slice(0, -1);
-        else value += character;
+        // Tokens are printable ASCII; drop control keys and escape sequences' ESC bytes.
+        else if (character >= "!" && character <= "~") value += character;
       }
     };
 
@@ -162,15 +186,25 @@ async function main(): Promise<void> {
     );
   }
 
-  const secrets = await api.call(
-    Secrets,
-    "GET",
-    `/secrets_store/stores/${storeId}/secrets?per_page=100`,
-  );
+  const secrets: Array<typeof Secret.Type> = [];
 
-  if (!secrets.success) throw new ClaimStopped("The API token cannot list Secrets Store secrets.");
+  for (let page = 1; ; page += 1) {
+    const listed = await api.call(
+      Secrets,
+      "GET",
+      `/secrets_store/stores/${storeId}/secrets?per_page=100&page=${page}`,
+    );
 
-  const existing = secrets.result?.find((secret) => secret.name === ACCESS_URL_SECRET_NAME);
+    if (!listed.success) throw new ClaimStopped("The API token cannot list Secrets Store secrets.");
+
+    secrets.push(...(listed.result ?? []));
+
+    if ((listed.result ?? []).length === 0 || page >= (listed.result_info?.total_pages ?? page))
+      break;
+  }
+
+  const existing = secrets.find((secret) => secret.name === ACCESS_URL_SECRET_NAME);
+  const pending = existing?.comment === PENDING_COMMENT;
 
   if (args.has("--forget")) {
     if (existing === undefined) {
@@ -194,8 +228,41 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (existing !== undefined && !args.has("--replace")) {
+  if (existing !== undefined && !pending && !args.has("--replace")) {
     throw new ClaimStopped("An access URL is already stored. Pass --replace to overwrite it.");
+  }
+
+  // Prove the token can write the secret before spending the one-time setup token. A new
+  // secret starts as a placeholder the bridge treats as "not connected".
+  const probe =
+    existing === undefined
+      ? await api.call(Secrets, "POST", `/secrets_store/stores/${storeId}/secrets`, [
+          {
+            name: ACCESS_URL_SECRET_NAME,
+            value: ACCESS_URL_PLACEHOLDER,
+            scopes: ["workers"],
+            comment: PENDING_COMMENT,
+          },
+        ])
+      : await api.call(
+          Anything,
+          "PATCH",
+          `/secrets_store/stores/${storeId}/secrets/${existing.id}`,
+          {
+            comment: pending ? PENDING_COMMENT : CLAIMED_COMMENT,
+          },
+        );
+
+  const secretId =
+    existing?.id ??
+    (Array.isArray(probe.result)
+      ? probe.result.find((secret) => secret.name === ACCESS_URL_SECRET_NAME)?.id
+      : undefined);
+
+  if (!probe.success || secretId === undefined) {
+    throw new ClaimStopped(
+      "The API token cannot write Secrets Store secrets; it needs Secrets Store Edit.",
+    );
   }
 
   const setupToken = args.has("--stdin")
@@ -210,32 +277,14 @@ async function main(): Promise<void> {
 
   if (Result.isFailure(claimed)) throw new ClaimStopped(claimed.failure.message);
 
-  const accessUrl = Redacted.value(claimed.success);
+  const stored = await api
+    .call(Anything, "PATCH", `/secrets_store/stores/${storeId}/secrets/${secretId}`, {
+      value: Redacted.value(claimed.success),
+      comment: CLAIMED_COMMENT,
+    })
+    .catch(() => undefined);
 
-  const stored =
-    existing === undefined
-      ? await api.call(Anything, "POST", `/secrets_store/stores/${storeId}/secrets`, [
-          {
-            name: ACCESS_URL_SECRET_NAME,
-            value: accessUrl,
-            scopes: ["workers"],
-            comment:
-              "SimpleFIN access URL for the simplefin-bridge Worker. Written by scripts/claim.ts.",
-          },
-        ])
-      : await api.call(
-          Anything,
-          "PATCH",
-          `/secrets_store/stores/${storeId}/secrets/${existing.id}`,
-          { value: accessUrl },
-        );
-
-  if (!stored.success) {
-    throw new ClaimStopped(
-      "The token was claimed but Cloudflare refused to store the access URL, which has been discarded. " +
-        "Disable this app's connection at https://bridge.simplefin.org, create a new setup token, and run the claim again.",
-    );
-  }
+  if (stored === undefined || !stored.success) throw new ClaimStopped(DISABLE_ADVICE);
 
   console.log(
     "Claimed. The access URL is in Secrets Store and was never displayed or written to disk.",

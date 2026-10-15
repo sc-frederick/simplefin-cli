@@ -275,3 +275,78 @@ describe("automatic sync", () => {
     }
   }, 60_000);
 });
+
+describe("Durable Object limits", () => {
+  let miniflare: Miniflare;
+
+  const busyCard = Array.from({ length: 150 }, (_, index) => ({
+    id: `busy-${index}`,
+    accountId: "card-1",
+    posted: NOW - (index % 40) * 86_400 - 3600,
+    amount: "-3.25",
+    description: `CORNER STORE ${index}`,
+  }));
+
+  const bridge = makeFakeBridge([...sampleTransactions(NOW), ...busyCard], NOW - 600);
+
+  beforeAll(async () => {
+    ({ miniflare } = startWorker({
+      scriptPath: bundle.scriptPath,
+      signer,
+      bridge,
+      autoSyncHours: "0",
+    }));
+
+    const secret = await miniflare.getSecretsStoreSecretAPI("SIMPLEFIN_ACCESS_URL");
+
+    await secret().create(TEST_ACCESS_URL);
+  });
+
+  afterAll(async () => {
+    await miniflare.dispose();
+  });
+
+  test("parallel sync_now calls run one sync, within the request budget", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => callTool(miniflare, "sync_now")),
+    );
+
+    const outcomes = results.map((result) => result.result.structuredContent);
+
+    expect(bridge.received).toHaveLength(9);
+    expect(outcomes.filter((outcome) => outcome.requests === 9)).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.skipped === true)).toHaveLength(7);
+  });
+
+  test("a window with more than 100 transactions per account is stored", async () => {
+    const listed = await callTool(miniflare, "list_transactions", {
+      account: "Rewards",
+      since: null,
+      limit: 1000,
+    });
+
+    expect(listed.result.isError).toBe(false);
+    expect(listed.result.structuredContent.transactions.length).toBeGreaterThan(150);
+  });
+
+  test("long searches and account names work despite SQLite's LIKE pattern limit", async () => {
+    const search = await callTool(miniflare, "list_transactions", {
+      search: "x".repeat(100),
+      since: null,
+    });
+
+    const account = await callTool(miniflare, "list_transactions", {
+      account: "y".repeat(200),
+      since: null,
+    });
+
+    expect(search.result).toMatchObject({
+      isError: false,
+      structuredContent: { transactions: [] },
+    });
+    expect(account.result).toMatchObject({
+      isError: false,
+      structuredContent: { transactions: [] },
+    });
+  });
+});

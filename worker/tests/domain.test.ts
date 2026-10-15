@@ -134,6 +134,23 @@ describe("bank text", () => {
       "PAY LAP ME NOW",
     );
     expect(sanitizeText("x".repeat(1000))).toHaveLength(300);
+
+    // Unicode tag characters ("ASCII smuggling"), soft hyphens, variation selectors and fillers.
+    const smuggled = String.fromCodePoint(
+      0xe0049,
+      0xe0067,
+      0xe006e,
+      0xad,
+      0xfe0f,
+      0x3164,
+      0x2800,
+      0xe0100,
+    );
+
+    expect(sanitizeText(`Coffee${smuggled}Shop`)).toBe("Coffee Shop");
+    expect(sanitizeText(`Caf\u00e9 ${String.fromCodePoint(0x1f600)}`)).toBe(
+      `Caf\u00e9 ${String.fromCodePoint(0x1f600)}`,
+    );
   });
 });
 
@@ -174,6 +191,46 @@ describe("account set parsing", () => {
       true,
     );
     expect(parsed.messages.some((message) => message.includes("1 account record(s)"))).toBe(true);
+  });
+
+  test("drops impossible timestamps, invalid balances and hidden characters in ids", () => {
+    const hidden = String.fromCodePoint(0xe0041, 0x200b);
+
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [
+            {
+              id: `acct${hidden}-1`,
+              balance: "lots of money",
+              "available-balance": "12.50",
+              "balance-date": 9e12,
+              transactions: [
+                { id: "far-future", posted: 9e12, amount: "-1.00", description: "x" },
+                { id: "negative", posted: -5, amount: "-1.00", description: "x" },
+                {
+                  id: "fine",
+                  posted: 1_800_000_000,
+                  transacted_at: 9e12,
+                  amount: "-1.00",
+                  description: "x",
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+
+    const account = parsed.accounts[0];
+
+    expect(account?.id).toBe("acct -1");
+    expect(account?.balance).toBeNull();
+    expect(account?.availableBalance).toBe("12.50");
+    expect(account?.balanceDate).toBeNull();
+    expect(
+      account?.transactions?.map((transaction) => [transaction.id, transaction.transactedAt]),
+    ).toEqual([["fine", null]]);
   });
 
   test("rejects bodies that are not JSON objects", () => {

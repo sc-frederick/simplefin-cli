@@ -126,7 +126,15 @@ export async function handleEdgeRequest(
 
   if (body === undefined) return plain(413, "Too large or not UTF-8");
 
-  const answer = await dependencies.forward(body, request.headers.get("mcp-protocol-version"));
+  const answer = await dependencies
+    .forward(body, request.headers.get("mcp-protocol-version"))
+    .catch(() => undefined);
+
+  if (answer === undefined) {
+    dependencies.refused("ledger unavailable");
+
+    return plain(500, "Internal error");
+  }
 
   if (answer.body === null)
     return new Response(null, { status: answer.status, headers: SECURITY_HEADERS });

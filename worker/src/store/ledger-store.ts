@@ -1,4 +1,6 @@
-import { Clock, Context, Effect, Layer, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Match, Schema } from "effect";
+import type { SchemaError } from "effect/Schema";
+import type { SqlError } from "effect/sql/SqlError";
 import { SqlClient } from "effect/sql";
 import type { EpochSeconds } from "../domain/dates.ts";
 import type { LedgerEntry } from "../domain/recurring.ts";
@@ -146,7 +148,10 @@ export class LedgerStore extends Context.Service<
     ) => Effect.Effect<void, StorageError>;
     readonly requestsSince: (since: EpochSeconds) => Effect.Effect<number, StorageError>;
     readonly claimLease: (minGapSeconds: number) => Effect.Effect<boolean, StorageError>;
-    readonly setLease: (value: EpochSeconds) => Effect.Effect<void, StorageError>;
+    /** Move the lease forward to `value`; it never moves back, so backoff can't be shortened. */
+    readonly raiseLease: (value: EpochSeconds) => Effect.Effect<void, StorageError>;
+    /** Clear the lease; only a new claim does this. */
+    readonly resetLease: Effect.Effect<void, StorageError>;
     readonly leaseValue: Effect.Effect<EpochSeconds, StorageError>;
     readonly readSetting: (key: string) => Effect.Effect<string | null, StorageError>;
     readonly writeSetting: (key: string, value: string) => Effect.Effect<void, StorageError>;
@@ -199,17 +204,40 @@ export class LedgerStore extends Context.Service<
       const ownTxDate = sql.literal("COALESCE(NULLIF(posted, 0), transacted_at, first_seen)");
       const now = Clock.currentTimeMillis.pipe(Effect.map((ms) => Math.floor(ms / 1000)));
 
-      const failure = (operation: string) => () =>
-        new StorageError({ operation, message: `Storage failed during ${operation}.` });
+      /**
+       * Log why storage failed, then replace the error with a safe one. SQLite messages name
+       * limits and constraints, never bound values; schema errors can quote row data, so only
+       * their tag is logged.
+       */
+      const guard =
+        (operation: string) =>
+        <A, R>(effect: Effect.Effect<A, SqlError | SchemaError | StorageError, R>) =>
+          effect.pipe(
+            Effect.tapError((error) => {
+              const detail = Match.value(error).pipe(
+                Match.tag("SqlError", ({ reason }) =>
+                  reason.cause instanceof Error ? reason.cause.message.slice(0, 200) : reason._tag,
+                ),
+                Match.orElse(({ _tag }) => _tag),
+              );
+
+              return Effect.logError("Storage operation failed").pipe(
+                Effect.annotateLogs({ operation, detail }),
+              );
+            }),
+            Effect.mapError(
+              () => new StorageError({ operation, message: `Storage failed during ${operation}.` }),
+            ),
+          );
+
+      /** Bind a list as one JSON parameter: Durable Object SQLite allows only 100 bound parameters. */
+      const jsonList = (values: ReadonlyArray<string>) =>
+        sql`(SELECT value FROM json_each(${JSON.stringify(values)}))`;
 
       const decodeRows =
         <S extends Schema.Top>(schema: S) =>
         (rows: ReadonlyArray<object>) =>
           Schema.decodeUnknownEffect(Schema.Array(schema))(rows);
-
-      /** Escape LIKE wildcards so user search text matches literally. */
-      const likePattern = (text: string) =>
-        `%${text.replace(/[\\%_]/gu, (match) => `\\${match}`)}%`;
 
       const firstOrNull = <A>(rows: ReadonlyArray<A>): A | null => rows[0] ?? null;
 
@@ -283,11 +311,11 @@ export class LedgerStore extends Context.Service<
 
             yield* sql`DELETE FROM transactions WHERE account_id = ${account.id} AND pending = 1
               AND ${ownTxDate} >= ${window.start} AND ${ownTxDate} < ${window.end}
-              ${seen.length > 0 ? sql`AND id NOT IN ${sql.in(seen)}` : sql.literal("")}`;
+              AND id NOT IN ${jsonList(seen)}`;
           }
 
           return { new: inserted, updated };
-        }).pipe(sql.withTransaction, Effect.mapError(failure("storeAccountSet")));
+        }).pipe(sql.withTransaction, guard("storeAccountSet"));
 
       const finishRun: LedgerStore["Service"]["finishRun"] = (id, outcome) =>
         Effect.gen(function* () {
@@ -306,7 +334,7 @@ export class LedgerStore extends Context.Service<
           // Bound bookkeeping growth; quota accounting only needs the last day.
           yield* sql`DELETE FROM sync_runs WHERE id <= ${id - 500}`;
           yield* sql`DELETE FROM requests WHERE at < ${stamp - 7 * 86_400}`;
-        }).pipe(Effect.mapError(failure("finishRun")));
+        }).pipe(guard("finishRun"));
 
       const lastRun = (where: "ok" | "any") =>
         (where === "ok"
@@ -315,7 +343,7 @@ export class LedgerStore extends Context.Service<
         ).pipe(Effect.flatMap(decodeRows(SyncRunRow)), Effect.map(firstOrNull));
 
       const accountFilter = (accountIds: ReadonlyArray<string> | null) =>
-        accountIds === null ? sql.literal("1=1") : sql`t.account_id IN ${sql.in(accountIds)}`;
+        accountIds === null ? sql.literal("1=1") : sql`t.account_id IN ${jsonList(accountIds)}`;
 
       const periodClauses = (filter: PeriodFilter) => [
         accountFilter(filter.accountIds),
@@ -324,10 +352,7 @@ export class LedgerStore extends Context.Service<
       ];
 
       return LedgerStore.of({
-        migrate: migrate.pipe(
-          Effect.provideService(SqlClient.SqlClient, sql),
-          Effect.mapError(failure("migrate")),
-        ),
+        migrate: migrate.pipe(Effect.provideService(SqlClient.SqlClient, sql), guard("migrate")),
 
         storeAccountSet,
 
@@ -341,19 +366,19 @@ export class LedgerStore extends Context.Service<
             );
 
           return rows[0]?.id ?? 0;
-        }).pipe(Effect.mapError(failure("beginRequest"))),
+        }).pipe(guard("beginRequest")),
 
         finishRequest: (id, ok, note) =>
           sql`UPDATE requests SET ok = ${ok ? 1 : 0}, note = ${note} WHERE id = ${id}`.pipe(
             Effect.asVoid,
-            Effect.mapError(failure("finishRequest")),
+            guard("finishRequest"),
           ),
 
         requestsSince: (since) =>
           sql`SELECT COUNT(*) AS n FROM requests WHERE at > ${since}`.pipe(
             Effect.flatMap(decodeRows(CountRow)),
             Effect.map((rows) => rows[0]?.n ?? 0),
-            Effect.mapError(failure("requestsSince")),
+            guard("requestsSince"),
           ),
 
         // A single conditional UPDATE is atomic, so overlapping callers can never both claim it.
@@ -367,18 +392,24 @@ export class LedgerStore extends Context.Service<
               WHERE key = 'sync_lease' AND value <= ${stamp - minGapSeconds} RETURNING key`;
 
             return claimed.length === 1;
-          }).pipe(Effect.mapError(failure("claimLease"))),
+          }).pipe(guard("claimLease")),
 
-        setLease: (value) =>
-          sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('sync_lease', ${value})`.pipe(
+        raiseLease: (value) =>
+          sql`INSERT INTO meta (key, value) VALUES ('sync_lease', ${value})
+            ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)`.pipe(
             Effect.asVoid,
-            Effect.mapError(failure("setLease")),
+            guard("raiseLease"),
           ),
+
+        resetLease: sql`INSERT OR REPLACE INTO meta (key, value) VALUES ('sync_lease', 0)`.pipe(
+          Effect.asVoid,
+          guard("resetLease"),
+        ),
 
         leaseValue: sql`SELECT value FROM meta WHERE key = 'sync_lease'`.pipe(
           Effect.flatMap(decodeRows(ValueRow)),
           Effect.map((rows) => Number(rows[0]?.value ?? 0)),
-          Effect.mapError(failure("leaseValue")),
+          guard("leaseValue"),
         ),
 
         readSetting: (key) =>
@@ -389,13 +420,13 @@ export class LedgerStore extends Context.Service<
 
               return value === undefined || value === null ? null : String(value);
             }),
-            Effect.mapError(failure("readSetting")),
+            guard("readSetting"),
           ),
 
         writeSetting: (key, value) =>
           sql`INSERT OR REPLACE INTO meta (key, value) VALUES (${`setting:${key}`}, ${value})`.pipe(
             Effect.asVoid,
-            Effect.mapError(failure("writeSetting")),
+            guard("writeSetting"),
           ),
 
         startRun: (window) =>
@@ -408,7 +439,7 @@ export class LedgerStore extends Context.Service<
             );
 
             return rows[0]?.id ?? 0;
-          }).pipe(Effect.mapError(failure("startRun"))),
+          }).pipe(guard("startRun")),
 
         finishRun,
 
@@ -425,10 +456,10 @@ export class LedgerStore extends Context.Service<
             lastSuccess: success[0]?.finished ?? null,
             lastComplete: complete[0]?.finished ?? null,
           };
-        }).pipe(Effect.mapError(failure("history"))),
+        }).pipe(guard("history")),
 
-        lastSuccessfulRun: lastRun("ok").pipe(Effect.mapError(failure("lastSuccessfulRun"))),
-        lastAttempt: lastRun("any").pipe(Effect.mapError(failure("lastAttempt"))),
+        lastSuccessfulRun: lastRun("ok").pipe(guard("lastSuccessfulRun")),
+        lastAttempt: lastRun("any").pipe(guard("lastAttempt")),
 
         counts: Effect.gen(function* () {
           const accounts = yield* sql`SELECT COUNT(*) AS n FROM accounts`.pipe(
@@ -440,13 +471,13 @@ export class LedgerStore extends Context.Service<
           );
 
           return { accounts: accounts[0]?.n ?? 0, transactions: transactions[0]?.n ?? 0 };
-        }).pipe(Effect.mapError(failure("counts"))),
+        }).pipe(guard("counts")),
 
         resolveAccountIds: (account) =>
-          sql`SELECT id FROM accounts WHERE id = ${account} OR name LIKE ${likePattern(account)} ESCAPE '\\'`.pipe(
+          sql`SELECT id FROM accounts WHERE id = ${account} OR instr(lower(name), lower(${account})) > 0`.pipe(
             Effect.flatMap(decodeRows(IdRow)),
             Effect.map((rows) => rows.map((row) => row.id)),
-            Effect.mapError(failure("resolveAccountIds")),
+            guard("resolveAccountIds"),
           ),
 
         accounts:
@@ -455,18 +486,20 @@ export class LedgerStore extends Context.Service<
             FROM accounts a LEFT JOIN connections c ON c.conn_id = a.conn_id
             ORDER BY institution, a.name`.pipe(
             Effect.flatMap(decodeRows(AccountRow)),
-            Effect.mapError(failure("accounts")),
+            guard("accounts"),
           ),
 
         transactions: (filter) => {
-          const search = filter.search === null ? null : likePattern(filter.search);
+          const search = filter.search;
 
           const clauses = [
             ...periodClauses(filter),
             search === null
               ? sql.literal("1=1")
-              : sql`(t.description LIKE ${search} ESCAPE '\\' OR t.payee LIKE ${search} ESCAPE '\\'
-                  OR t.memo LIKE ${search} ESCAPE '\\')`,
+              : // instr matches literally and has no pattern-length limit (LIKE is capped at 50 bytes).
+                sql`(instr(lower(t.description), lower(${search})) > 0
+                  OR instr(lower(coalesce(t.payee, '')), lower(${search})) > 0
+                  OR instr(lower(coalesce(t.memo, '')), lower(${search})) > 0)`,
             filter.minCents === null
               ? sql.literal("1=1")
               : sql`t.amount_cents >= ${filter.minCents}`,
@@ -484,17 +517,17 @@ export class LedgerStore extends Context.Service<
               WHERE ${sql.and(clauses)}
               ORDER BY date DESC, t.id DESC LIMIT ${filter.limit}`.pipe(
             Effect.flatMap(decodeRows(TransactionRow)),
-            Effect.mapError(failure("transactions")),
+            guard("transactions"),
           );
         },
 
         balanceHistory: (accountIds, since) =>
           sql`SELECT a.name, s.balance_date, s.balance, s.available_balance
               FROM balance_snapshots s JOIN accounts a ON a.id = s.account_id
-              WHERE s.account_id IN ${sql.in(accountIds)} AND s.balance_date >= ${since}
+              WHERE s.account_id IN ${jsonList(accountIds)} AND s.balance_date >= ${since}
               ORDER BY s.balance_date DESC LIMIT 1000`.pipe(
             Effect.flatMap(decodeRows(BalanceRow)),
-            Effect.mapError(failure("balanceHistory")),
+            guard("balanceHistory"),
           ),
 
         cashFlow: (filter) =>
@@ -505,7 +538,7 @@ export class LedgerStore extends Context.Service<
               WHERE t.pending = 0 AND ${sql.and(periodClauses(filter))}
               GROUP BY t.account_id ORDER BY money_out DESC`.pipe(
             Effect.flatMap(decodeRows(CashFlowRow)),
-            Effect.mapError(failure("cashFlow")),
+            guard("cashFlow"),
           ),
 
         postedEntries: (filter) =>
@@ -523,13 +556,13 @@ export class LedgerStore extends Context.Service<
                 account: row.account,
               })),
             ),
-            Effect.mapError(failure("postedEntries")),
+            guard("postedEntries"),
           ),
 
         earliestTransaction: sql`SELECT MIN(${txDate}) AS earliest FROM transactions t`.pipe(
           Effect.flatMap(decodeRows(EarliestRow)),
           Effect.map((rows) => rows[0]?.earliest ?? null),
-          Effect.mapError(failure("earliestTransaction")),
+          guard("earliestTransaction"),
         ),
       });
     }),

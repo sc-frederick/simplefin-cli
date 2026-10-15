@@ -96,6 +96,16 @@ function tool<P extends Schema.Top & { readonly DecodingServices: never }>(spec:
         Effect.flatMap((params) =>
           spec.run(params).pipe(Effect.mapError((error) => error.message)),
         ),
+        // A bug must not take down the request or leak a stack: report a generic tool error.
+        Effect.catchDefect((defect) =>
+          Effect.logError("Tool failed unexpectedly").pipe(
+            Effect.annotateLogs({
+              tool: spec.name,
+              defect: defect instanceof Error ? defect.name : "unknown",
+            }),
+            Effect.andThen(Effect.fail("The tool failed unexpectedly.")),
+          ),
+        ),
         Effect.match({ onFailure: failureResult, onSuccess: successResult }),
         Effect.withSpan(`tool.${spec.name}`),
       ),

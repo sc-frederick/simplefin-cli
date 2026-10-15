@@ -93,6 +93,32 @@ describe("automatic sync", () => {
     expect(AutoSyncOutcome.$is("Synced")(result.afterClaim)).toBe(true);
   });
 
+  test("a manual sync during the revoked-access backoff does not shorten it", async () => {
+    const bridge = makeFakeBridge([]);
+
+    bridge.failure = { status: 403, body: "Forbidden" };
+
+    const result = await runLedger(
+      { bridge, accessUrl: () => TEST_ACCESS_URL },
+      Effect.gen(function* () {
+        yield* autoSync;
+        yield* TestClock.adjust("11 minutes");
+
+        const manual = yield* manualSync;
+
+        yield* TestClock.adjust("4 hours");
+
+        return { manual, auto: yield* autoSync };
+      }),
+    );
+
+    expect(result.manual).toMatchObject({
+      error: expect.stringContaining("rejected the access credentials"),
+    });
+    expect(AutoSyncOutcome.$is("Leased")(result.auto)).toBe(true);
+    expect(bridge.received).toHaveLength(2);
+  });
+
   test("ordinary failures retry no sooner than three hours", async () => {
     const bridge = makeFakeBridge([]);
 

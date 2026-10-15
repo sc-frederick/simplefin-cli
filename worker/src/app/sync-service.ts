@@ -1,4 +1,4 @@
-import { Clock, Context, Data, Effect, Layer, Option, Result, Schema } from "effect";
+import { Clock, Context, Data, Effect, Layer, Option, Result, Schema, Semaphore } from "effect";
 import type { Calendar, EpochSeconds } from "../domain/dates.ts";
 import { DAY } from "../domain/dates.ts";
 import {
@@ -161,8 +161,8 @@ export class SyncService extends Context.Service<
           });
         }
 
-        // Manual syncs always run, but they push back automatic ones.
-        if (!holdsLease) yield* store.setLease(startedAt);
+        // Manual syncs always run, but they push back automatic ones (never shortening a backoff).
+        if (!holdsLease) yield* store.raiseLease(startedAt);
 
         const runId = yield* store.startRun({ start: oldest.start, end: newest.end });
         const errors: Array<string> = [];
@@ -235,97 +235,127 @@ export class SyncService extends Context.Service<
 
           if (previous === fingerprint) return;
 
-          yield* store.setLease(0);
+          yield* store.resetLease;
           yield* store.writeSetting(FINGERPRINT_SETTING, fingerprint);
+        });
+
+      /**
+       * One sync at a time in this Durable Object, whether the alarm or sync_now started it. A
+       * sync awaits the network between storage writes, so without this two could interleave
+       * and both pass the budget check.
+       */
+      const gate = yield* Semaphore.make(1);
+
+      const exclusive = <A, E, R>(effect: Effect.Effect<A, E, R>, whenBusy: A) =>
+        effect.pipe(gate.withPermitsIfAvailable(1), Effect.map(Option.getOrElse(() => whenBusy)));
+
+      const autoSyncNow = (checkedAt: number) =>
+        Effect.gen(function* () {
+          const credentials = yield* settings.credentials.pipe(Effect.orElseSucceed(() => null));
+
+          if (credentials === null) return AutoSyncOutcome.NotConnected();
+
+          yield* noticeNewCredentials(credentials);
+
+          const { lastSuccess } = yield* store.history;
+
+          if (lastSuccess !== null && checkedAt - lastSuccess < settings.autoSyncSeconds) {
+            return AutoSyncOutcome.Fresh({ nextCheck: lastSuccess + settings.autoSyncSeconds });
+          }
+
+          if (!(yield* store.claimLease(AUTO_SYNC_RETRY_SECONDS))) {
+            const lease = yield* store.leaseValue;
+
+            return AutoSyncOutcome.Leased({
+              nextCheck: Math.max(checkedAt + 60, lease + AUTO_SYNC_RETRY_SECONDS),
+            });
+          }
+
+          const failed = (error: SyncError, retryAfter: number) =>
+            Effect.logWarning("SimpleFIN auto-sync failed").pipe(
+              Effect.annotateLogs({ error: error._tag }),
+              Effect.as(
+                AutoSyncOutcome.Failed({
+                  nextCheck: checkedAt + retryAfter,
+                  error: errorMessage(error),
+                }),
+              ),
+            );
+
+          // Revoked access and unpaid subscriptions don't fix themselves: back off a day. A new
+          // claim changes the credential fingerprint, which clears this.
+          const blocked = (error: SyncError) =>
+            store
+              .raiseLease(checkedAt + BLOCKED_RETRY_SECONDS - AUTO_SYNC_RETRY_SECONDS)
+              .pipe(Effect.andThen(failed(error, BLOCKED_RETRY_SECONDS)));
+
+          return yield* sync(true).pipe(
+            Effect.map((report) =>
+              AutoSyncOutcome.Synced({ nextCheck: checkedAt + settings.autoSyncSeconds, report }),
+            ),
+            Effect.catchTags({ AccessRevoked: blocked, PaymentRequired: blocked }),
+            Effect.catch((error) => failed(error, AUTO_SYNC_RETRY_SECONDS)),
+          );
         });
 
       const autoSync: Effect.Effect<AutoSyncOutcome, StorageError> = Effect.gen(function* () {
         if (settings.autoSyncSeconds <= 0) return AutoSyncOutcome.Disabled();
 
-        const credentials = yield* settings.credentials.pipe(Effect.orElseSucceed(() => null));
-
-        if (credentials === null) return AutoSyncOutcome.NotConnected();
-
-        yield* noticeNewCredentials(credentials);
-
         const checkedAt = yield* now;
-        const { lastSuccess } = yield* store.history;
 
-        if (lastSuccess !== null && checkedAt - lastSuccess < settings.autoSyncSeconds) {
-          return AutoSyncOutcome.Fresh({ nextCheck: lastSuccess + settings.autoSyncSeconds });
-        }
-
-        if (!(yield* store.claimLease(AUTO_SYNC_RETRY_SECONDS))) {
-          const lease = yield* store.leaseValue;
-
-          return AutoSyncOutcome.Leased({
-            nextCheck: Math.max(checkedAt + 60, lease + AUTO_SYNC_RETRY_SECONDS),
-          });
-        }
-
-        const failed = (error: SyncError, retryAfter: number) =>
-          Effect.logWarning("SimpleFIN auto-sync failed").pipe(
-            Effect.annotateLogs({ error: error._tag }),
-            Effect.as(
-              AutoSyncOutcome.Failed({
-                nextCheck: checkedAt + retryAfter,
-                error: errorMessage(error),
-              }),
-            ),
-          );
-
-        // Revoked access and unpaid subscriptions don't fix themselves: back off a day. A new
-        // claim changes the credential fingerprint, which clears this.
-        const blocked = (error: SyncError) =>
-          store
-            .setLease(checkedAt + BLOCKED_RETRY_SECONDS - AUTO_SYNC_RETRY_SECONDS)
-            .pipe(Effect.andThen(failed(error, BLOCKED_RETRY_SECONDS)));
-
-        return yield* sync(true).pipe(
-          Effect.map((report) =>
-            AutoSyncOutcome.Synced({ nextCheck: checkedAt + settings.autoSyncSeconds, report }),
-          ),
-          Effect.catchTags({ AccessRevoked: blocked, PaymentRequired: blocked }),
-          Effect.catch((error) => failed(error, AUTO_SYNC_RETRY_SECONDS)),
+        return yield* exclusive(
+          autoSyncNow(checkedAt),
+          AutoSyncOutcome.Leased({ nextCheck: checkedAt + RECENT_ATTEMPT_SECONDS }),
         );
       });
 
-      const manualSync: Effect.Effect<ManualSyncOutcome, StorageError> = Effect.gen(function* () {
-        const requestedAt = yield* now;
-        const lease = yield* store.leaseValue;
+      const manualSyncNow: Effect.Effect<ManualSyncOutcome, StorageError> = Effect.gen(
+        function* () {
+          const requestedAt = yield* now;
+          const lease = yield* store.leaseValue;
 
-        if (lease > 0 && requestedAt - lease >= 0 && requestedAt - lease < RECENT_ATTEMPT_SECONDS) {
-          return {
-            skipped: true,
-            reason: "Another sync started in the last 10 minutes; check sync_status shortly.",
-          } as const;
-        }
+          if (
+            lease > 0 &&
+            requestedAt - lease >= 0 &&
+            requestedAt - lease < RECENT_ATTEMPT_SECONDS
+          ) {
+            return {
+              skipped: true,
+              reason: "Another sync started in the last 10 minutes; check sync_status shortly.",
+            } as const;
+          }
 
-        const { lastSuccess } = yield* store.history;
+          const { lastSuccess } = yield* store.history;
 
-        if (lastSuccess !== null && requestedAt - lastSuccess < MIN_MANUAL_SYNC_SECONDS) {
-          return {
-            skipped: true,
-            reason: "Last sync was under an hour ago; the Bridge only refreshes about daily.",
-            last_successful_sync: settings.calendar.format(lastSuccess),
-          } as const;
-        }
+          if (lastSuccess !== null && requestedAt - lastSuccess < MIN_MANUAL_SYNC_SECONDS) {
+            return {
+              skipped: true,
+              reason: "Last sync was under an hour ago; the Bridge only refreshes about daily.",
+              last_successful_sync: settings.calendar.format(lastSuccess),
+            } as const;
+          }
 
-        const reportable = (error: Exclude<SyncError, StorageError>) =>
-          Effect.succeed({ error: errorMessage(error) });
+          const reportable = (error: Exclude<SyncError, StorageError>) =>
+            Effect.succeed({ error: errorMessage(error) });
 
-        return yield* sync(false).pipe(
-          Effect.catchTags({
-            AccessRevoked: reportable,
-            PaymentRequired: reportable,
-            EdgeBlocked: reportable,
-            BridgeUnavailable: reportable,
-            InvalidBridgeResponse: reportable,
-            InvalidAccessUrl: reportable,
-            QuotaExceeded: reportable,
-            NotConnected: reportable,
-          }),
-        );
+          return yield* sync(false).pipe(
+            Effect.catchTags({
+              AccessRevoked: reportable,
+              PaymentRequired: reportable,
+              EdgeBlocked: reportable,
+              BridgeUnavailable: reportable,
+              InvalidBridgeResponse: reportable,
+              InvalidAccessUrl: reportable,
+              QuotaExceeded: reportable,
+              NotConnected: reportable,
+            }),
+          );
+        },
+      );
+
+      const manualSync: Effect.Effect<ManualSyncOutcome, StorageError> = exclusive(manualSyncNow, {
+        skipped: true,
+        reason: "A sync is already running; check sync_status shortly.",
       });
 
       const status: Effect.Effect<SyncStatus, StorageError> = Effect.gen(function* () {

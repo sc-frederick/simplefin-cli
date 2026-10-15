@@ -116,24 +116,8 @@ export const verifyAccessToken = Effect.fn("verifyAccessToken")(function* (
     Effect.mapError(() => deny("unsupported token header")),
   );
 
-  const claims = yield* decodeClaims(payloadText).pipe(
-    Effect.mapError(() => deny("not a service token")),
-  );
-
-  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-
-  if (!audiences.includes(policy.audience)) return yield* deny("wrong audience");
-
-  if (claims.iss !== policy.teamDomain) return yield* deny("wrong issuer");
-
-  if (claims.exp + CLOCK_SKEW_SECONDS < nowSeconds) return yield* deny("expired");
-
-  if (claims.nbf !== undefined && claims.nbf - CLOCK_SKEW_SECONDS > nowSeconds) {
-    return yield* deny("not yet valid");
-  }
-
-  if (!sameText(claims.common_name, policy.clientId)) return yield* deny("unexpected client");
-
+  // Verify the signature before reading any claim, so unsigned input never steers the checks
+  // below and timing reveals nothing about which claim would have matched.
   const key = yield* Effect.tryPromise({
     try: () => resolveKey(header.kid),
     catch: () => deny("signing keys unavailable"),
@@ -153,6 +137,24 @@ export const verifyAccessToken = Effect.fn("verifyAccessToken")(function* (
   });
 
   if (!valid) return yield* deny("bad signature");
+
+  const claims = yield* decodeClaims(payloadText).pipe(
+    Effect.mapError(() => deny("not a service token")),
+  );
+
+  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+
+  if (!audiences.includes(policy.audience)) return yield* deny("wrong audience");
+
+  if (claims.iss !== policy.teamDomain) return yield* deny("wrong issuer");
+
+  if (claims.exp + CLOCK_SKEW_SECONDS < nowSeconds) return yield* deny("expired");
+
+  if (claims.nbf !== undefined && claims.nbf - CLOCK_SKEW_SECONDS > nowSeconds) {
+    return yield* deny("not yet valid");
+  }
+
+  if (!sameText(claims.common_name, policy.clientId)) return yield* deny("unexpected client");
 
   return claims;
 });
@@ -197,17 +199,30 @@ export function cachedKeyResolver(
 ): KeyResolver {
   let keys: Map<string, CryptoKey> | null = null;
   let loadedAt = 0;
+  let failedAt = Number.NEGATIVE_INFINITY;
   let inFlight: Promise<Map<string, CryptoKey>> | null = null;
 
   const load = (): Promise<Map<string, CryptoKey>> => {
+    // After a failed fetch, refuse for a minute instead of refetching on every request.
+    if (now() - failedAt < UNKNOWN_KID_COOLDOWN_MS) {
+      return Promise.reject(new Error("Signing keys recently unavailable"));
+    }
+
     inFlight ??= fetchText(`${teamDomain}/cdn-cgi/access/certs`)
       .then((json) => Effect.runPromise(importJwks(json)))
-      .then((loaded) => {
-        keys = loaded;
-        loadedAt = now();
+      .then(
+        (loaded) => {
+          keys = loaded;
+          loadedAt = now();
 
-        return loaded;
-      })
+          return loaded;
+        },
+        (cause: unknown) => {
+          failedAt = now();
+
+          throw cause;
+        },
+      )
       .finally(() => {
         inFlight = null;
       });

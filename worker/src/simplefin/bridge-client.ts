@@ -74,7 +74,7 @@ const send = (fetch: FetchFunction, url: string, init: RequestInit) =>
     }),
   );
 
-/** Read a response body as text, refusing bodies over the limit without buffering them. */
+/** Read a response body as text within the timeout, refusing bodies over the limit without buffering them. */
 const readBoundedText = (response: Response) =>
   Effect.tryPromise({
     try: async () => {
@@ -121,6 +121,11 @@ const readBoundedText = (response: Response) =>
           )
         : Effect.succeed(text),
     ),
+    Effect.timeoutOrElse({
+      duration: REQUEST_TIMEOUT,
+      orElse: () =>
+        Effect.fail(new BridgeUnavailable({ message: "SimpleFIN Bridge response timed out." })),
+    }),
   );
 
 /** Distinguish the CDN's "error code: 1010" pages from SimpleFIN's own 403. */

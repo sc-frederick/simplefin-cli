@@ -120,89 +120,93 @@ const toolsList = {
  * Handle one POSTed JSON-RPC message. Authentication, method, content type and size checks
  * happen at the edge before this runs.
  */
-export const handleMcpMessage = Effect.fn("mcp.handleMessage")(function* (
-  bodyText: string,
-  protocolHeader: string | null,
-  autoSyncHours: number,
-): Effect.fn.Return<McpHttpResponse, never, LedgerQueries | SyncService> {
-  if (
-    protocolHeader !== null &&
-    !SUPPORTED_PROTOCOL_VERSIONS.some((version) => version === protocolHeader)
-  ) {
-    return rpcError(null, ErrorCode.invalidRequest, "Unsupported MCP-Protocol-Version.", 400);
-  }
-
-  const parsed = decodeJson(bodyText);
-
-  if (Option.isNone(parsed)) return rpcError(null, ErrorCode.parse, "Parse error.", 400);
-
-  if (Option.isSome(decodeBatch(parsed.value))) {
-    return rpcError(
-      null,
-      ErrorCode.invalidRequest,
-      "Batched JSON-RPC messages are not supported.",
-      400,
-    );
-  }
-
-  const request = decodeRequest(parsed.value);
-
-  if (Option.isNone(request)) {
-    // Notifications (e.g. notifications/initialized) and responses need no answer.
-    const accepted =
-      Option.isSome(decodeNotification(parsed.value)) ||
-      Option.isSome(decodeResponse(parsed.value));
-
-    return accepted
-      ? { status: 202, body: null }
-      : rpcError(null, ErrorCode.invalidRequest, "Invalid request.", 400);
-  }
-
-  const { id, method, params } = request.value;
-
-  switch (method) {
-    case "initialize": {
-      const initialize = decodeInitialize(params);
-
-      if (Option.isNone(initialize))
-        return rpcError(id, ErrorCode.invalidParams, "Invalid initialize params.");
-
-      const requested = initialize.value.protocolVersion;
-
-      const protocolVersion =
-        SUPPORTED_PROTOCOL_VERSIONS.find((version) => version === requested) ??
-        SUPPORTED_PROTOCOL_VERSIONS[0];
-
-      return respond(id, {
-        result: {
-          protocolVersion,
-          capabilities: { tools: { listChanged: false } },
-          serverInfo: SERVER_INFO,
-          instructions: serverInstructions(autoSyncHours),
-        },
-      });
+export const handleMcpMessage = Effect.fn("mcp.handleMessage")(
+  function* (
+    bodyText: string,
+    protocolHeader: string | null,
+    autoSyncHours: number,
+  ): Effect.fn.Return<McpHttpResponse, never, LedgerQueries | SyncService> {
+    if (
+      protocolHeader !== null &&
+      !SUPPORTED_PROTOCOL_VERSIONS.some((version) => version === protocolHeader)
+    ) {
+      return rpcError(null, ErrorCode.invalidRequest, "Unsupported MCP-Protocol-Version.", 400);
     }
 
-    case "ping":
-      return respond(id, { result: {} });
+    const parsed = decodeJson(bodyText);
 
-    case "tools/list":
-      return respond(id, { result: toolsList });
+    if (Option.isNone(parsed)) return rpcError(null, ErrorCode.parse, "Parse error.", 400);
 
-    case "tools/call": {
-      const call = decodeCallTool(params);
-
-      if (Option.isNone(call))
-        return rpcError(id, ErrorCode.invalidParams, "Invalid tools/call params.");
-
-      const tool = TOOLS.find((candidate) => candidate.name === call.value.name);
-
-      if (tool === undefined) return rpcError(id, ErrorCode.invalidParams, "Unknown tool.");
-
-      return respond(id, { result: yield* tool.call(call.value) });
+    if (Option.isSome(decodeBatch(parsed.value))) {
+      return rpcError(
+        null,
+        ErrorCode.invalidRequest,
+        "Batched JSON-RPC messages are not supported.",
+        400,
+      );
     }
 
-    default:
-      return rpcError(id, ErrorCode.methodNotFound, "Method not found.");
-  }
-});
+    const request = decodeRequest(parsed.value);
+
+    if (Option.isNone(request)) {
+      // Notifications (e.g. notifications/initialized) and responses need no answer.
+      const accepted =
+        Option.isSome(decodeNotification(parsed.value)) ||
+        Option.isSome(decodeResponse(parsed.value));
+
+      return accepted
+        ? { status: 202, body: null }
+        : rpcError(null, ErrorCode.invalidRequest, "Invalid request.", 400);
+    }
+
+    const { id, method, params } = request.value;
+
+    switch (method) {
+      case "initialize": {
+        const initialize = decodeInitialize(params);
+
+        if (Option.isNone(initialize))
+          return rpcError(id, ErrorCode.invalidParams, "Invalid initialize params.");
+
+        const requested = initialize.value.protocolVersion;
+
+        const protocolVersion =
+          SUPPORTED_PROTOCOL_VERSIONS.find((version) => version === requested) ??
+          SUPPORTED_PROTOCOL_VERSIONS[0];
+
+        return respond(id, {
+          result: {
+            protocolVersion,
+            capabilities: { tools: { listChanged: false } },
+            serverInfo: SERVER_INFO,
+            instructions: serverInstructions(autoSyncHours),
+          },
+        });
+      }
+
+      case "ping":
+        return respond(id, { result: {} });
+
+      case "tools/list":
+        return respond(id, { result: toolsList });
+
+      case "tools/call": {
+        const call = decodeCallTool(params);
+
+        if (Option.isNone(call))
+          return rpcError(id, ErrorCode.invalidParams, "Invalid tools/call params.");
+
+        const tool = TOOLS.find((candidate) => candidate.name === call.value.name);
+
+        if (tool === undefined) return rpcError(id, ErrorCode.invalidParams, "Unknown tool.");
+
+        return respond(id, { result: yield* tool.call(call.value) });
+      }
+
+      default:
+        return rpcError(id, ErrorCode.methodNotFound, "Method not found.");
+    }
+  },
+  // Anything unexpected becomes a JSON-RPC internal error rather than an unhandled exception.
+  Effect.catchDefect(() => Effect.succeed(rpcError(null, -32603, "Internal error.", 500))),
+);

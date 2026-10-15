@@ -13,6 +13,16 @@ import { LedgerStore } from "./store/ledger-store.ts";
 /** How soon to look again when no access URL has been claimed yet. */
 const NOT_CONNECTED_RECHECK_SECONDS = 3600;
 
+/** Answer for an unexpected failure; details stay in the logs, never in the response. */
+const INTERNAL_ERROR: McpHttpResponse = {
+  status: 500,
+  body: JSON.stringify({
+    jsonrpc: "2.0",
+    id: null,
+    error: { code: -32603, message: "Internal error." },
+  }),
+};
+
 /** Name of the one ledger object; the bridge serves one owner. */
 export const VAULT_NAME = "ledger";
 
@@ -76,9 +86,9 @@ export class SimplefinVault extends DurableObject<Env> {
 
   /** Answer one authenticated MCP message. */
   async handleMcp(body: string, protocolVersion: string | null): Promise<McpHttpResponse> {
-    const response = await this.#runtime.runPromise(
-      handleMcpMessage(body, protocolVersion, this.#autoSyncHours),
-    );
+    const response = await this.#runtime
+      .runPromise(handleMcpMessage(body, protocolVersion, this.#autoSyncHours))
+      .catch(() => INTERNAL_ERROR);
 
     await this.#ensureAlarm();
 

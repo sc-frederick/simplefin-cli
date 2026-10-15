@@ -5,6 +5,7 @@ import { calendarFor, parseTimeZone } from "./domain/dates.ts";
 import type { AccessPolicy } from "./edge/access-token.ts";
 import type { Env } from "./env.ts";
 import type { FetchFunction } from "./simplefin/bridge-client.ts";
+import { ACCESS_URL_PLACEHOLDER } from "./deployment.ts";
 import { parseAccessUrl } from "./simplefin/credentials.ts";
 
 /** A binding value that alchemy.run.ts should have rejected at deploy time. */
@@ -96,8 +97,13 @@ export function bridgeSettingsFrom(
       }
     }).pipe(
       Effect.flatMap((accessUrl) => {
-        if (accessUrl === null || Redacted.value(accessUrl).trim() === "")
+        // Missing, empty, or the claim script's placeholder: not connected yet.
+        if (
+          accessUrl === null ||
+          [ACCESS_URL_PLACEHOLDER, ""].includes(Redacted.value(accessUrl).trim())
+        ) {
           return Effect.succeed(null);
+        }
 
         const parsed = parseAccessUrl(accessUrl);
 

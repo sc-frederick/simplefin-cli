@@ -100,6 +100,9 @@ export function calendarFor(timeZone: TimeZone): Calendar {
   };
 
   const format = (timestamp: EpochSeconds): string => {
+    // Out-of-range values are rejected at ingest; never let one throw while rendering a result.
+    if (!Number.isFinite(timestamp) || Math.abs(timestamp) > 8.64e12) return "invalid date";
+
     const parts = zonedParts(timestamp * 1000);
     const sign = parts.offsetMinutes < 0 ? "-" : "+";
     const magnitude = Math.abs(parts.offsetMinutes);

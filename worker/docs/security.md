@@ -21,10 +21,11 @@ so the custom domain is the only way in. Turn on strict service-token authentica
 Access organization, so failed token requests get 401/403 instead of a login redirect.
 
 **2. Worker: verify again, fail closed** (`src/edge/`). Every request must carry a
-`Cf-Access-Jwt-Assertion` that verifies against the team's published keys (RS256 only). It must
-also name this application's audience and the team issuer, be within its validity window, be
+`Cf-Access-Jwt-Assertion` whose signature verifies against the team's published keys (RS256
+only) before any claim is read. The token must also name this application's audience and the team issuer, be within its validity window, be
 an application token (`type: "app"`), and be issued to Executor's client ID (`common_name`,
-compared in constant time). Authentication happens before routing, so unauthenticated callers
+compared in constant time). A failed key fetch backs off for a minute, so bad tokens can't
+make the Worker hammer the team's key endpoint. Authentication happens before routing, so unauthenticated callers
 can't probe paths or methods. If Access were removed or misconfigured, every request would get 403. Authenticated requests must then pass these checks:
 
 - No `Origin` header. MCP clients here are servers, so a browser origin means cross-site use or DNS rebinding.
@@ -37,18 +38,23 @@ The server keeps no MCP sessions, so there is no session state to steal or fixat
 
 **3. Durable Object: one ledger, no other entrances** (`src/vault.ts`). Only the Worker can
 reach it, and only after layer 2. It exposes `handleMcp` and an hourly `watchdog`. All SQL is
-parameterized, and search text is matched literally (`LIKE` wildcards are escaped). Every tool
-is read-only except `sync_now`, which only fetches from SimpleFIN.
+parameterized. Id lists travel as one JSON parameter, because Durable Object SQLite allows at
+most 100 bound parameters, and search uses `instr` rather than `LIKE`, which matches literally
+and avoids SQLite's 50-byte pattern limit. Every tool is read-only except `sync_now`, which
+only fetches from SimpleFIN. An unexpected error becomes a generic tool or JSON-RPC error, so
+details stay in the logs.
 
 **4. SimpleFIN client: the credential goes one place** (`src/simplefin/`):
 
 - Setup tokens and access URLs must be HTTPS on `bridge.simplefin.org` or `beta-bridge.simplefin.org`, on the default port, with no query string. A forged setup token can't point the bridge elsewhere.
 - Credentials travel only in the `Authorization` header, never in a URL.
 - Redirects are never followed (`redirect: "manual"`, and any 3xx response is an error), so a redirect can't carry credentials to another host or to plain HTTP.
-- Responses are size-bounded (25 MiB) and must be strict UTF-8. Each record is schema-decoded on its own, so one malformed record is skipped and reported instead of stopping the sync.
+- Responses are size-bounded (25 MiB), time-bounded, and must be strict UTF-8. Each record is schema-decoded on its own, so one malformed record is skipped and reported instead of stopping the sync.
+- Timestamps outside 1970–2100, balances that aren't decimal amounts, and ids that are empty once cleaned are dropped at ingest.
 
-**5. The access URL is never handled loosely.** `scripts/claim.ts` checks the Cloudflare token
-and the Secrets Store before spending the one-time setup token. It reads the setup token with
+**5. The access URL is never handled loosely.** Before spending the one-time setup token,
+`scripts/claim.ts` proves its Cloudflare token can write the secret: it writes a placeholder,
+which the bridge treats as "not connected", or updates the existing secret's comment. It reads the setup token with
 echo off (or from stdin), claims it, and writes the access URL straight into Secrets Store.
 Secrets Store never returns stored values. The access URL is never printed, logged or written
 to disk, and unexpected errors print only their type. Inside the Worker it is wrapped in Effect
@@ -68,13 +74,16 @@ The code logs only event names, refusal reasons, error tags and counts. It never
 bodies, amounts, descriptions, tokens or URLs.
 
 **8. Text from banks is untrusted.** Merchant names, payees and memos are attacker-controlled in
-the prompt-injection sense. Control characters, bidirectional overrides and zero-width
-characters are stripped, values are length-bounded, and the server instructions tell agents to
-treat the text as data.
+the prompt-injection sense, and so are ids. Every control, format, private-use and unassigned
+code point is stripped: bidirectional overrides, zero-width characters, and Unicode tag
+characters ("ASCII smuggling"). So are variation selectors and blank-looking fillers. Values
+are length-bounded, and the server instructions tell agents to treat the text as data.
 
-**9. Quota abuse can't get the token disabled.** Requests are recorded before they're sent, and
-the 20-a-day budget is checked before any sync. The lease is claimed with one atomic SQL update,
-so the alarm and `sync_now` can't both start a sync. The alarm handler never throws, which
+**9. Quota abuse can't get the token disabled.** Only one sync runs at a time in the Durable
+Object, whether the alarm or `sync_now` started it, and concurrent callers are told it's
+busy. Requests are recorded before they're sent, and the 20-a-day budget is checked before any
+sync. The lease only moves forward, so `sync_now` can't shorten the one-day backoff after the
+Bridge revokes access; only a new claim clears it. The alarm handler never throws, which
 avoids the runtime's immediate retries.
 
 ## What remains

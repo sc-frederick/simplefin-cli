@@ -6,8 +6,9 @@
  */
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
-import { Config, ConfigProvider, Effect, Schema } from "effect";
+import { Config, ConfigProvider, Effect, Result, Schema } from "effect";
 import { ACCESS_URL_SECRET_NAME, COMPATIBILITY_DATE } from "./src/deployment.ts";
+import { parseTimeZone } from "./src/domain/dates.ts";
 import type { SimplefinVault } from "./src/vault.ts";
 
 /**
@@ -78,6 +79,19 @@ export default Alchemy.Stack(
     }
 
     const executorTokenId = yield* ExecutorTokenId;
+    const timeZone = yield* TimeZone;
+    const initialSyncDays = yield* InitialSyncDays;
+
+    // Apply the Worker's own parsers, so a value the runtime would reject fails the deploy instead.
+    if (Result.isFailure(parseTimeZone(timeZone))) {
+      return yield* Effect.fail(
+        refuseDeploy(`TIME_ZONE ${JSON.stringify(timeZone)} is not a known time zone.`),
+      );
+    }
+
+    if (Number(initialSyncDays) < 1 || Number(initialSyncDays) > 730) {
+      return yield* Effect.fail(refuseDeploy("INITIAL_SYNC_DAYS must be between 1 and 730."));
+    }
 
     // Edge authentication: only Executor's service token gets through. Alchemy finishes the
     // application before the Worker, which reads its audience tag.
@@ -115,9 +129,9 @@ export default Alchemy.Stack(
         ACCESS_TEAM_DOMAIN: yield* AccessTeamDomain,
         ACCESS_AUD: access.aud,
         EXECUTOR_CLIENT_ID: yield* ExecutorClientId,
-        TIME_ZONE: yield* TimeZone,
+        TIME_ZONE: timeZone,
         AUTO_SYNC_HOURS: yield* AutoSyncHours,
-        INITIAL_SYNC_DAYS: yield* InitialSyncDays,
+        INITIAL_SYNC_DAYS: initialSyncDays,
         APP_STAGE: Alchemy.Stage,
       },
     });

@@ -1,19 +1,19 @@
 /**
- * Control characters plus invisible formatting characters (bidirectional overrides, zero-width
- * joiners, byte-order marks) that can hide or reorder text shown to people and models. Kept as
- * code points so the source never contains the invisible characters themselves.
+ * Characters that hide, reorder or smuggle text past a human reader while a model still reads
+ * it: every control, format (bidirectional overrides, zero-width joiners, Unicode tag
+ * characters), private-use and unassigned code point, plus variation selectors and blank-looking
+ * fillers. Written as escapes inside a string so the source never contains the characters.
  */
-const HIDDEN_RANGES: ReadonlyArray<readonly [number, number]> = [
-  [0x00, 0x1f],
-  [0x7f, 0x9f],
-  [0x200b, 0x200f],
-  [0x202a, 0x202e],
-  [0x2060, 0x2069],
-  [0xfeff, 0xfeff],
-];
-
 const HIDDEN_CHARACTERS = new RegExp(
-  `[${HIDDEN_RANGES.map(([low, high]) => `\\u{${low.toString(16)}}-\\u{${high.toString(16)}}`).join("")}]`,
+  [
+    "[",
+    "\\p{Cc}\\p{Cf}\\p{Co}\\p{Cn}",
+    // Combining grapheme joiner, Mongolian variation selectors, variation selectors 1-256.
+    "\\u{34f}\\u{180b}-\\u{180f}\\u{fe00}-\\u{fe0f}\\u{e0100}-\\u{e01ef}",
+    // Hangul fillers and the Braille blank, which render as nothing.
+    "\\u{115f}\\u{1160}\\u{3164}\\u{ffa0}\\u{2800}",
+    "]",
+  ].join(""),
   "gu",
 );
 
@@ -27,7 +27,12 @@ export const MAX_TEXT_LENGTH = 300;
 export function sanitizeText(text: string, maxLength: number = MAX_TEXT_LENGTH): string {
   const visible = text.replace(HIDDEN_CHARACTERS, " ").replace(/\s+/gu, " ").trim();
 
-  return visible.length > maxLength ? `${visible.slice(0, maxLength - 1)}…` : visible;
+  const characters = Array.from(visible);
+
+  // Cut on code points, never inside a surrogate pair.
+  return characters.length > maxLength
+    ? `${characters.slice(0, maxLength - 1).join("")}…`
+    : visible;
 }
 
 /** Sanitize an optional value, keeping absence and collapsing empty text to absence. */
