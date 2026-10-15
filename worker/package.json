@@ -1,0 +1,42 @@
+{
+  "name": "simplefin-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SimpleFIN Bridge sync in a Cloudflare Durable Object, served to Executor as a private MCP server",
+  "author": "Stephen Frederick",
+  "type": "module",
+  "scripts": {
+    "check": "vp check",
+    "test": "vp test run",
+    "test:auth": "vp test run tests/auth.e2e.test.ts",
+    "verify": "pnpm check && pnpm test",
+    "effect:setup": "effect-tsgo patch --typescript-package @typescript/native",
+    "claim": "node scripts/claim.ts",
+    "plan": "alchemy plan --stage production",
+    "deploy": "node scripts/deploy.ts",
+    "executor:check": "cd executor-app && test -f host.ts || cp host.example.ts host.ts; npm install --no-package-lock --ignore-scripts --silent && npx -y -p typescript@7.0.2 tsc --ignoreConfig --noEmit --strict --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 index.ts"
+  },
+  "dependencies": {
+    "@effect/sql-sqlite-do": "4.0.4",
+    "effect": "4.0.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261014.1",
+    "@effect/platform-node": "4.0.4",
+    "@effect/sql-sqlite-node": "4.0.4",
+    "@effect/tsgo": "0.53.0",
+    "@oxlint/plugins": "1.88.0",
+    "@types/node": "24.10.0",
+    "@typescript/native": "npm:typescript@7.0.2",
+    "alchemy": "2.0.0-beta.83",
+    "miniflare": "4.20260730.0",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.2.0",
+    "vite-plus": "1.2.0",
+    "vitest": "5.0.4"
+  },
+  "engines": {
+    "node": ">=24.16.0"
+  },
+  "packageManager": "pnpm@12.11.2"
+}

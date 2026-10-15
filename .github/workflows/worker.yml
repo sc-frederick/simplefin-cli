@@ -1,0 +1,33 @@
+name: Worker
+on:
+  pull_request:
+    paths: ["worker/**", ".github/workflows/worker.yml"]
+  push:
+    branches: [main]
+    paths: ["worker/**", ".github/workflows/worker.yml"]
+permissions:
+  contents: read
+concurrency:
+  group: worker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: worker/.node-version
+          package-manager-cache: false
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: worker/package.json
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm effect:setup
+      - run: pnpm verify
+      - run: pnpm executor:check

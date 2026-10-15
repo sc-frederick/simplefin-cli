@@ -1,0 +1,9 @@
+overrides:
+  hono: 4.12.14
+  vite: npm:@voidzero-dev/vite-plus-core@1.2.0
+allowBuilds:
+  esbuild: true
+  workerd: true
+peerDependencyRules:
+  allowedVersions:
+    vite: "1.2.0"
