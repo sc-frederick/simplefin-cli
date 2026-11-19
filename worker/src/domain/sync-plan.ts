@@ -16,6 +16,12 @@ export const DAILY_BUDGET = 20;
  */
 export const AUTO_SYNC_RETRY_SECONDS = 3 * 3600;
 
+/**
+ * Most extra requests one sync spends re-fetching earlier incomplete windows, so an account
+ * that stays broken can't use up the daily budget.
+ */
+export const MAX_RETRY_WINDOWS = 4;
+
 /** Backoff after the Bridge revokes access or asks for payment; neither fixes itself. */
 export const BLOCKED_RETRY_SECONDS = DAY;
 
@@ -43,6 +49,7 @@ export interface SyncHistory {
  * Plan request windows, newest first. The first successful sync backfills `initialDays`. Later
  * syncs resume from the last complete sync, so gaps get re-fetched, but never reach back more
  * than two windows; without any complete sync they fetch one window, as the upstream CLI does.
+ * Older windows that came back incomplete are re-fetched separately; see {@link retryWindows}.
  */
 export function planWindows(
   now: EpochSeconds,
@@ -58,14 +65,68 @@ export function planWindows(
         ? end - WINDOW_DAYS * DAY
         : now - initialDays * DAY;
 
+  return chunk({ start, end });
+}
+
+/** Split one range into request windows of at most {@link WINDOW_DAYS}, newest first. */
+function chunk(range: SyncWindow): Array<SyncWindow> {
   const windows: Array<SyncWindow> = [];
 
-  for (let cursor = end; cursor > start;) {
-    const windowStart = Math.max(start, cursor - WINDOW_DAYS * DAY);
+  for (let cursor = range.end; cursor > range.start;) {
+    const windowStart = Math.max(range.start, cursor - WINDOW_DAYS * DAY);
 
     windows.push({ start: windowStart, end: cursor });
     cursor = windowStart;
   }
 
   return windows;
+}
+
+/** Merge overlapping or touching ranges, oldest first; empty ranges are dropped. */
+export function mergeWindows(ranges: ReadonlyArray<SyncWindow>): Array<SyncWindow> {
+  const sorted = ranges
+    .filter((range) => range.end > range.start)
+    .toSorted((a, b) => a.start - b.start);
+
+  const merged: Array<SyncWindow> = [];
+
+  for (const range of sorted) {
+    const last = merged.at(-1);
+
+    if (last !== undefined && range.start <= last.end) {
+      merged[merged.length - 1] = { start: last.start, end: Math.max(last.end, range.end) };
+    } else {
+      merged.push(range);
+    }
+  }
+
+  return merged;
+}
+
+/** The parts of `ranges` that `cut` does not cover, merged and oldest first. */
+export function subtractWindow(
+  ranges: ReadonlyArray<SyncWindow>,
+  cut: SyncWindow,
+): Array<SyncWindow> {
+  return mergeWindows(
+    ranges.flatMap((range) => [
+      { start: range.start, end: Math.min(range.end, cut.start) },
+      { start: Math.max(range.start, cut.end), end: range.end },
+    ]),
+  );
+}
+
+/**
+ * Request windows that re-fetch earlier incomplete ranges (`gaps`), newest first: the parts
+ * `planned` doesn't already cover, at most `limit` of them. Gaps that don't fit stay recorded
+ * for the next sync.
+ */
+export function retryWindows(
+  gaps: ReadonlyArray<SyncWindow>,
+  planned: ReadonlyArray<SyncWindow>,
+  limit: number,
+): Array<SyncWindow> {
+  const uncovered = planned.reduce(subtractWindow, mergeWindows(gaps));
+
+  return uncovered.toReversed().flatMap(chunk).slice(0, Math.max(0, limit));
 }

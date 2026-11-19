@@ -12,6 +12,7 @@
     "verify": "pnpm check && pnpm test",
     "effect:setup": "effect-tsgo patch --typescript-package @typescript/native",
     "claim": "node scripts/claim.ts",
+    "bootstrap": "node scripts/claim.ts --bootstrap",
     "plan": "alchemy plan --stage production",
     "deploy": "node scripts/deploy.ts",
     "executor:check": "cd executor-app && test -f host.ts || cp host.example.ts host.ts; npm install --no-package-lock --ignore-scripts --silent && npx -y -p typescript@7.0.2 tsc --ignoreConfig --noEmit --strict --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 index.ts"

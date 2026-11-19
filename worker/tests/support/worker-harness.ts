@@ -1,11 +1,13 @@
 import { webcrypto } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import type { Request as MiniflareRequest } from "miniflare";
+import { DatabaseSync } from "node:sqlite";
+import type { Miniflare as MiniflareInstance, Request as MiniflareRequest } from "miniflare";
 import { Miniflare, Response as MiniflareResponse, supportedCompatibilityDate } from "miniflare";
 import { build } from "vite";
 import type { FakeBridge } from "./fake-bridge.ts";
+import type { JsonObject } from "./json.ts";
 
 /** Test Access team; its signing keys are served by the outbound fake below. */
 export const TEAM_DOMAIN = "https://example-team.cloudflareaccess.com";
@@ -132,6 +134,8 @@ export function startWorker(options: {
   readonly signer: TestSigner;
   readonly bridge: FakeBridge;
   readonly autoSyncHours: string;
+  /** Keep Durable Object and Secrets Store data here, so a later start sees it. */
+  readonly persistRoot?: string | undefined;
 }): RunningWorker {
   const outbound: OutboundLog = { hosts: [] };
 
@@ -140,6 +144,7 @@ export function startWorker(options: {
     scriptPath: options.scriptPath,
     modulesRoot: dirname(options.scriptPath),
     compatibilityDate: supportedCompatibilityDate,
+    defaultPersistRoot: options.persistRoot,
     durableObjects: { VAULT: { className: "SimplefinVault", useSQLite: true } },
     bindings: {
       ACCESS_TEAM_DOMAIN: TEAM_DOMAIN,
@@ -182,4 +187,73 @@ export function startWorker(options: {
   });
 
   return { miniflare, outbound };
+}
+
+/**
+ * Pretend `seconds` have passed for a stopped Worker's persisted ledger by moving its sync
+ * bookkeeping (runs, requests, lease) back. Data time ranges, such as recorded gaps, stay put.
+ */
+export async function ageLedger(persistRoot: string, seconds: number): Promise<void> {
+  const files = await readdir(join(persistRoot, "do"), { recursive: true });
+  let aged = 0;
+
+  for (const file of files.filter((name) => name.endsWith(".sqlite"))) {
+    const database = new DatabaseSync(join(persistRoot, "do", file));
+
+    try {
+      const tables = database
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_runs'")
+        .all();
+
+      if (tables.length === 0) continue;
+
+      database
+        .prepare("UPDATE sync_runs SET started_at = started_at - ?, finished_at = finished_at - ?")
+        .run(seconds, seconds);
+      database.prepare("UPDATE requests SET at = at - ?").run(seconds);
+      database
+        .prepare("UPDATE meta SET value = value - ? WHERE key = 'sync_lease' AND value > 0")
+        .run(seconds);
+      aged += 1;
+    } finally {
+      database.close();
+    }
+  }
+
+  if (aged !== 1) throw new Error(`Expected one persisted ledger, found ${aged}.`);
+}
+
+/** A temporary directory for {@link startWorker}'s `persistRoot`. */
+export function makePersistRoot(): Promise<string> {
+  return mkdtemp(join(tmpdir(), "simplefin-persist-"));
+}
+
+/** Call one MCP tool as Executor, with a fresh service-token JWT. */
+export async function callTool(
+  miniflare: MiniflareInstance,
+  signer: TestSigner,
+  name: string,
+  args: JsonObject = {},
+) {
+  const token = await signer.sign(serviceTokenClaims());
+
+  const response = await miniflare.dispatchFetch("https://simplefin.example.test/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2025-11-25",
+      "cf-access-jwt-assertion": token,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
+  });
+
+  const raw = await response.text();
+
+  return { status: response.status, raw, result: JSON.parse(raw).result };
 }

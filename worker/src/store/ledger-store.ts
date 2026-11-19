@@ -5,7 +5,9 @@ import { SqlClient } from "effect/sql";
 import type { EpochSeconds } from "../domain/dates.ts";
 import type { LedgerEntry } from "../domain/recurring.ts";
 import type { SyncHistory, SyncWindow } from "../domain/sync-plan.ts";
+import { mergeWindows, subtractWindow } from "../domain/sync-plan.ts";
 import type { AccountSet } from "../simplefin/account-set.ts";
+import { displayId } from "../simplefin/account-set.ts";
 import { migrate } from "./migrations.ts";
 
 /** A storage failure, safe to show: it names the operation, never the data. */
@@ -118,7 +120,8 @@ const EntryRow = Schema.Struct({
   account: Schema.String,
 });
 
-const IdRow = Schema.Struct({ id: Schema.String });
+const AccountNameRow = Schema.Struct({ id: Schema.String, name: Schema.String });
+const GapRow = Schema.Struct({ window_start: Schema.Int, window_end: Schema.Int });
 const CountRow = Schema.Struct({ n: Schema.Int });
 const ValueRow = Schema.Struct({ value: Schema.NullOr(Schema.Union([Schema.Int, Schema.String])) });
 const EarliestRow = Schema.Struct({ earliest: NullableInt });
@@ -136,6 +139,10 @@ export class LedgerStore extends Context.Service<
   LedgerStore,
   {
     readonly migrate: Effect.Effect<void, StorageError>;
+    /**
+     * Store one response for `window` and update the recorded gaps in the same transaction: an
+     * incomplete response adds the window, a complete one clears it.
+     */
     readonly storeAccountSet: (
       set: AccountSet,
       window: SyncWindow,
@@ -169,6 +176,8 @@ export class LedgerStore extends Context.Service<
         | { readonly ok: false; readonly errors: ReadonlyArray<string> },
     ) => Effect.Effect<void, StorageError>;
     readonly history: Effect.Effect<SyncHistory, StorageError>;
+    /** Ranges whose last fetch was incomplete, merged and oldest first. */
+    readonly gaps: Effect.Effect<ReadonlyArray<SyncWindow>, StorageError>;
     readonly lastSuccessfulRun: Effect.Effect<SyncRunRow | null, StorageError>;
     readonly lastAttempt: Effect.Effect<SyncRunRow | null, StorageError>;
     readonly counts: Effect.Effect<
@@ -241,6 +250,14 @@ export class LedgerStore extends Context.Service<
 
       const firstOrNull = <A>(rows: ReadonlyArray<A>): A | null => rows[0] ?? null;
 
+      const readGaps =
+        sql`SELECT window_start, window_end FROM sync_gaps ORDER BY window_start`.pipe(
+          Effect.flatMap(decodeRows(GapRow)),
+          Effect.map((rows) =>
+            rows.map((row) => ({ start: row.window_start, end: row.window_end })),
+          ),
+        );
+
       const storeAccountSet = (set: AccountSet, window: SyncWindow) =>
         Effect.gen(function* () {
           const stamp = yield* now;
@@ -299,19 +316,28 @@ export class LedgerStore extends Context.Service<
             }
 
             // A pending transaction usually reappears under a new id once it posts, so pending rows
-            // in the fetched window that the server no longer returns are stale. Skip accounts the
-            // Bridge reported errors for, since their missing rows prove nothing.
-            const healthy =
-              !set.accountsWithErrors.has(account.id) &&
-              (account.connId === null || !set.connectionsWithErrors.has(account.connId));
-
-            if (!healthy) continue;
+            // in the fetched window that the server no longer returns are stale. That holds only
+            // when the list is the account's whole list: an unreadable record or a reported error
+            // means a missing row proves nothing.
+            if (!account.transactionsComplete) continue;
 
             const seen = account.transactions.map((transaction) => transaction.id);
 
             yield* sql`DELETE FROM transactions WHERE account_id = ${account.id} AND pending = 1
               AND ${ownTxDate} >= ${window.start} AND ${ownTxDate} < ${window.end}
               AND id NOT IN ${jsonList(seen)}`;
+          }
+
+          const gaps = yield* readGaps;
+
+          const next = set.hasDataErrors
+            ? mergeWindows([...gaps, window])
+            : subtractWindow(gaps, window);
+
+          yield* sql`DELETE FROM sync_gaps`;
+
+          for (const gap of next) {
+            yield* sql`INSERT INTO sync_gaps (window_start, window_end) VALUES (${gap.start}, ${gap.end})`;
           }
 
           return { new: inserted, updated };
@@ -458,6 +484,8 @@ export class LedgerStore extends Context.Service<
           };
         }).pipe(guard("history")),
 
+        gaps: readGaps.pipe(guard("gaps")),
+
         lastSuccessfulRun: lastRun("ok").pipe(guard("lastSuccessfulRun")),
         lastAttempt: lastRun("any").pipe(guard("lastAttempt")),
 
@@ -473,12 +501,24 @@ export class LedgerStore extends Context.Service<
           return { accounts: accounts[0]?.n ?? 0, transactions: transactions[0]?.n ?? 0 };
         }).pipe(guard("counts")),
 
-        resolveAccountIds: (account) =>
-          sql`SELECT id FROM accounts WHERE id = ${account} OR instr(lower(name), lower(${account})) > 0`.pipe(
-            Effect.flatMap(decodeRows(IdRow)),
-            Effect.map((rows) => rows.map((row) => row.id)),
+        // Matched in code: agents see ids only in their display form, which SQL can't compute.
+        resolveAccountIds: (account) => {
+          const needle = account.toLowerCase();
+
+          return sql`SELECT id, name FROM accounts`.pipe(
+            Effect.flatMap(decodeRows(AccountNameRow)),
+            Effect.map((rows) =>
+              rows.flatMap((row) =>
+                row.id === account ||
+                displayId(row.id) === account ||
+                row.name.toLowerCase().includes(needle)
+                  ? [row.id]
+                  : [],
+              ),
+            ),
             guard("resolveAccountIds"),
-          ),
+          );
+        },
 
         accounts:
           sql`SELECT a.id, a.name, a.currency, a.balance, a.available_balance, a.balance_date,

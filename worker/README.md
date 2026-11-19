@@ -69,6 +69,7 @@ pnpm install --frozen-lockfile && pnpm effect:setup
 pnpm verify            # format, lint, types, unit + workerd end-to-end tests
 pnpm test:auth         # just the Access and request-filtering tests
 pnpm executor:check    # type-check the Executor app against its pinned framework
+pnpm bootstrap         # before the first deploy: create the placeholder access URL secret
 pnpm plan              # preview infrastructure changes (needs Cloudflare credentials)
 pnpm deploy            # verify, then deploy stage "production" from a clean checkout
 pnpm claim             # claim a setup token into Secrets Store (owner only, in a terminal)

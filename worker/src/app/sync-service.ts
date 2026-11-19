@@ -5,9 +5,11 @@ import {
   AUTO_SYNC_RETRY_SECONDS,
   BLOCKED_RETRY_SECONDS,
   DAILY_BUDGET,
+  MAX_RETRY_WINDOWS,
   MIN_MANUAL_SYNC_SECONDS,
   RECENT_ATTEMPT_SECONDS,
   planWindows,
+  retryWindows,
 } from "../domain/sync-plan.ts";
 import { sanitizeText } from "../domain/text.ts";
 import type { FetchAccountsError, FetchFunction } from "../simplefin/bridge-client.ts";
@@ -58,7 +60,10 @@ export interface SyncReport {
   readonly accounts: number;
   readonly transactions_new: number;
   readonly transactions_updated: number;
+  /** True only when every window in this sync and every earlier incomplete window is complete. */
   readonly complete: boolean;
+  /** Requests still needed to re-fetch windows that came back incomplete. */
+  readonly windows_to_retry: number;
   readonly errors: ReadonlyArray<string>;
 }
 
@@ -143,28 +148,37 @@ export class SyncService extends Context.Service<
       const sync = Effect.fn("SyncService.sync")(function* (holdsLease: boolean) {
         const credentials = yield* requireCredentials;
         const startedAt = yield* now;
-        const windows = planWindows(startedAt, yield* store.history, settings.initialSyncDays);
+        const planned = planWindows(startedAt, yield* store.history, settings.initialSyncDays);
         const used = yield* store.requestsSince(startedAt - DAY);
-        const oldest = windows.at(-1);
-        const newest = windows[0];
 
-        if (oldest === undefined || newest === undefined) {
+        if (planned.length === 0) {
           return yield* new QuotaExceeded({ message: "Nothing to sync." });
         }
 
-        if (used + windows.length > DAILY_BUDGET) {
+        if (used + planned.length > DAILY_BUDGET) {
           return yield* new QuotaExceeded({
             message:
-              `${used} SimpleFIN requests in the last 24h; this sync needs ${windows.length} more and the ` +
+              `${used} SimpleFIN requests in the last 24h; this sync needs ${planned.length} more and the ` +
               `local budget is ${DAILY_BUDGET}/day (the Bridge disables tokens that keep exceeding ~24/day). ` +
               "Try again later.",
           });
         }
 
+        // Earlier incomplete windows ride along with whatever budget is left.
+        const retries = retryWindows(
+          yield* store.gaps,
+          planned,
+          Math.min(MAX_RETRY_WINDOWS, DAILY_BUDGET - used - planned.length),
+        );
+
+        const windows = [...planned, ...retries];
+        const windowStart = Math.min(...windows.map((window) => window.start));
+        const windowEnd = Math.max(...windows.map((window) => window.end));
+
         // Manual syncs always run, but they push back automatic ones (never shortening a backoff).
         if (!holdsLease) yield* store.raiseLease(startedAt);
 
-        const runId = yield* store.startRun({ start: oldest.start, end: newest.end });
+        const runId = yield* store.startRun({ start: windowStart, end: windowEnd });
         const errors: Array<string> = [];
         const accounts = new Set<string>();
         let counts: StoredCounts = { new: 0, updated: 0 };
@@ -196,6 +210,12 @@ export class SyncService extends Context.Service<
         );
 
         yield* Effect.succeed(fetched);
+
+        // The checkpoint that later syncs resume from advances only when nothing is left to retry.
+        const remaining = retryWindows(yield* store.gaps, [], Number.POSITIVE_INFINITY).length;
+
+        complete = complete && remaining === 0;
+
         yield* store.finishRun(runId, {
           ok: true,
           complete,
@@ -211,18 +231,20 @@ export class SyncService extends Context.Service<
             transactionsNew: counts.new,
             transactionsUpdated: counts.updated,
             complete,
+            windowsToRetry: remaining,
             bridgeMessages: errors.length,
           }),
         );
 
         return {
           requests: windows.length,
-          window_start: settings.calendar.format(oldest.start),
-          window_end: settings.calendar.format(newest.end),
+          window_start: settings.calendar.format(windowStart),
+          window_end: settings.calendar.format(windowEnd),
           accounts: accounts.size,
           transactions_new: counts.new,
           transactions_updated: counts.updated,
           complete,
+          windows_to_retry: remaining,
           errors,
         } satisfies SyncReport;
       });

@@ -78,6 +78,17 @@ export const MIGRATIONS: ReadonlyArray<{
       )`,
     ],
   },
+  {
+    id: 2,
+    statements: [
+      // Time ranges whose last fetch was incomplete; every sync re-fetches some until they clear.
+      `CREATE TABLE sync_gaps (
+        window_start INTEGER NOT NULL,
+        window_end INTEGER NOT NULL,
+        PRIMARY KEY (window_start, window_end)
+      )`,
+    ],
+  },
 ];
 
 const AppliedMigration = Schema.Struct({ id: Schema.Int });

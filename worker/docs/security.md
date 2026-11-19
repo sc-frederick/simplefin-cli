@@ -50,11 +50,15 @@ details stay in the logs.
 - Credentials travel only in the `Authorization` header, never in a URL.
 - Redirects are never followed (`redirect: "manual"`, and any 3xx response is an error), so a redirect can't carry credentials to another host or to plain HTTP.
 - Responses are size-bounded (25 MiB), time-bounded, and must be strict UTF-8. Each record is schema-decoded on its own, so one malformed record is skipped and reported instead of stopping the sync.
-- Timestamps outside 1970–2100, balances that aren't decimal amounts, and ids that are empty once cleaned are dropped at ingest.
+- A 200 response without an `accounts` array is an error, not an empty account set. Any Bridge error, general or for one account or connection, or any unreadable record marks the window incomplete. Incomplete windows are recorded and re-fetched by later syncs (at most four extra requests each), and the "resume from" checkpoint advances only when none are left.
+- Stored pending rows missing from a response are pruned only when that account's list is complete: every record readable, the account listed once, and no error for it, its connection or the response.
+- Timestamps outside 1970–2100 and balances that aren't decimal amounts are dropped at ingest. Ids are stored exactly as the Bridge sends them (up to 512 characters), so records whose ids differ only in hidden characters or past any display limit stay distinct. Ids are cleaned like other text only when shown.
 
 **5. The access URL is never handled loosely.** Before spending the one-time setup token,
 `scripts/claim.ts` proves its Cloudflare token can write the secret: it writes a placeholder,
-which the bridge treats as "not connected", or updates the existing secret's comment. It reads the setup token with
+which the bridge treats as "not connected", or updates the existing secret's comment. Before
+the first deploy, `pnpm bootstrap` creates that placeholder so the Worker's binding resolves; it
+never writes a secret that already exists. It reads the setup token with
 echo off (or from stdin), claims it, and writes the access URL straight into Secrets Store.
 Secrets Store never returns stored values. The access URL is never printed, logged or written
 to disk, and unexpected errors print only their type. Inside the Worker it is wrapped in Effect
@@ -77,12 +81,12 @@ bodies, amounts, descriptions, tokens or URLs.
 the prompt-injection sense, and so are ids. Every control, format, private-use and unassigned
 code point is stripped: bidirectional overrides, zero-width characters, and Unicode tag
 characters ("ASCII smuggling"). So are variation selectors and blank-looking fillers. Values
-are length-bounded, and the server instructions tell agents to treat the text as data.
+are length-bounded, ids are cleaned the same way whenever a tool returns them, and the server instructions tell agents to treat the text as data.
 
 **9. Quota abuse can't get the token disabled.** Only one sync runs at a time in the Durable
 Object, whether the alarm or `sync_now` started it, and concurrent callers are told it's
 busy. Requests are recorded before they're sent, and the 20-a-day budget is checked before any
-sync. The lease only moves forward, so `sync_now` can't shorten the one-day backoff after the
+sync; re-fetching incomplete windows uses only what's left of it. The lease only moves forward, so `sync_now` can't shorten the one-day backoff after the
 Bridge revokes access; only a new claim clears it. The alarm handler never throws, which
 avoids the runtime's immediate retries.
 

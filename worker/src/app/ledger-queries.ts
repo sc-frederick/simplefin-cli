@@ -4,6 +4,7 @@ import type { InvalidAmount } from "../domain/money.ts";
 import { formatCents, parseAmountCents } from "../domain/money.ts";
 import type { MerchantSpending, RecurringReport } from "../domain/recurring.ts";
 import { findRecurring, topMerchants } from "../domain/recurring.ts";
+import { displayId } from "../simplefin/account-set.ts";
 import type { StorageError } from "../store/ledger-store.ts";
 import { LedgerStore } from "../store/ledger-store.ts";
 import { BridgeSettings } from "./sync-service.ts";
@@ -153,7 +154,7 @@ export class LedgerQueries extends Context.Service<
         accounts: store.accounts.pipe(
           Effect.map((rows) => ({
             accounts: rows.map((row) => ({
-              id: row.id,
+              id: displayId(row.id),
               name: row.name,
               institution: row.institution,
               connection: row.connection,
@@ -186,8 +187,8 @@ export class LedgerQueries extends Context.Service<
               transactions: rows.map((row) => ({
                 date: calendar.format(row.date),
                 account: row.account_name,
-                account_id: row.account_id,
-                id: row.id,
+                account_id: displayId(row.account_id),
+                id: displayId(row.id),
                 amount: row.amount,
                 currency: row.currency,
                 description: row.description,

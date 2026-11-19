@@ -6,12 +6,12 @@ ledger, and a staging copy of bank data would double the exposure for no benefit
 
 Secrets never go through this repository, chat, CI, or Alchemy state:
 
-| Secret                      | Created by                       | Stored in                                |
-| --------------------------- | -------------------------------- | ---------------------------------------- |
-| Access service token secret | You, in the Zero Trust dashboard | Executor's account form, pasted directly |
-| SimpleFIN setup token       | You, at bridge.simplefin.org     | Nowhere; `pnpm claim` spends it          |
-| SimpleFIN access URL        | `pnpm claim`                     | Cloudflare Secrets Store                 |
-| Cloudflare API tokens       | You                              | Your shell or an Alchemy profile         |
+| Secret                      | Created by                          | Stored in                                |
+| --------------------------- | ----------------------------------- | ---------------------------------------- |
+| Access service token secret | You, in the Zero Trust dashboard    | Executor's account form, pasted directly |
+| SimpleFIN setup token       | You, at bridge.simplefin.org        | Nowhere; `pnpm claim` spends it          |
+| SimpleFIN access URL        | `pnpm bootstrap`, then `pnpm claim` | Cloudflare Secrets Store                 |
+| Cloudflare API tokens       | You                                 | Your shell or an Alchemy profile         |
 
 ## 1. Access team settings
 
@@ -56,6 +56,20 @@ shared `Cloudflare.state()`; bootstrap it once per account with
 `pnpm exec alchemy cloudflare bootstrap` if no other project has.
 
 ## 4. Deploy
+
+The Worker binds the Secrets Store secret `simplefin-access-url` by name, and Cloudflare
+rejects a Worker upload whose bound secret doesn't exist (error 10182). So before the first
+deploy, create a placeholder:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID=<account id>
+pnpm bootstrap   # prompts for a Secrets Store–only API token (hidden), as pnpm claim does
+```
+
+It creates the account's Secrets Store if there is none, then the secret holding the value
+`pending-claim`, which the bridge treats as "not connected". If the secret already exists,
+claimed or not, it changes nothing, so running it again is safe. The token needs only
+_Account › Secrets Store › Edit_; § 6 uses the same token.
 
 ```sh
 pnpm plan     # review: Access application, Secrets Store (adopted), Worker, custom domain
@@ -103,6 +117,7 @@ first.
    ```
 
    The API token needs only _Account › Secrets Store › Edit_. Delete it afterwards if you like.
+   The claim replaces the placeholder from § 4 without asking for `--replace`.
    To pipe the setup token from a password manager instead: `op read … | pnpm claim --stdin`.
 
 3. Within the hour, the watchdog cron runs the first sync. To start it now, call `sync_now`

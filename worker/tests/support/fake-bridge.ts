@@ -32,7 +32,10 @@ export interface FakeBridge {
   transactions: Array<FakeTransaction>;
   /** When set, every request gets this response instead of data. */
   failure: { readonly status: number; readonly body: string; readonly location?: string } | null;
-  /** Bridge-level error entries added to every response. */
+  /**
+   * Bridge-level error entries added to every response. Like the real Bridge, an account with an
+   * act.* entry comes back without its transactions.
+   */
   errlist: Array<{ readonly code: string; readonly msg: string; readonly account_id?: string }>;
 }
 
@@ -156,6 +159,12 @@ export function makeFakeBridge(
       const start = Number(url.searchParams.get("start-date"));
       const end = Number(url.searchParams.get("end-date"));
 
+      const failing = new Set(
+        bridge.errlist.flatMap((error) =>
+          error.code.startsWith("act.") && error.account_id !== undefined ? [error.account_id] : [],
+        ),
+      );
+
       const body = {
         errors: [],
         errlist: bridge.errlist,
@@ -181,6 +190,7 @@ export function makeFakeBridge(
           "balance-date": pendingAt,
           transactions: bridge.transactions
             .filter((transaction) => transaction.accountId === account.id)
+            .filter(() => !failing.has(account.id))
             .filter((transaction) => {
               const at = transaction.pending === true ? pendingAt : transaction.posted;
 

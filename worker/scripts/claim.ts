@@ -6,6 +6,7 @@
  *   pnpm claim --stdin     read the setup token from stdin, e.g. from a password manager
  *   pnpm claim --replace   replace an access URL stored earlier
  *   pnpm claim --forget    delete the stored access URL
+ *   pnpm bootstrap         before the first deploy: create a placeholder secret if none exists
  *
  * Needs a Cloudflare API token limited to "Account › Secrets Store › Edit", read from
  * CLOUDFLARE_API_TOKEN or prompted for (hidden), and CLOUDFLARE_ACCOUNT_ID.
@@ -14,54 +15,27 @@
  * this process's memory and in Secrets Store, which never returns stored values. It is never
  * printed, logged, or written to disk.
  */
-import { Effect, Exit, Redacted, Result, Schema } from "effect";
-import { ACCESS_URL_PLACEHOLDER, ACCESS_URL_SECRET_NAME } from "../src/deployment.ts";
+import { Effect, Redacted, Result } from "effect";
 import { claimAccessUrl } from "../src/simplefin/bridge-client.ts";
 import { decodeSetupToken } from "../src/simplefin/credentials.ts";
+import { ACCESS_URL_SECRET_NAME } from "../src/deployment.ts";
+import {
+  Anything,
+  bootstrapAccessUrlSecret,
+  CLAIMED_COMMENT,
+  ClaimStopped,
+  createPlaceholder,
+  findStore,
+  listSecrets,
+  PENDING_COMMENT,
+  secretsStoreApi,
+} from "./secrets-store.ts";
 
-const API = "https://api.cloudflare.com/client/v4";
-
-const ApiEnvelope = <S extends Schema.Top>(result: S) =>
-  Schema.Struct({
-    success: Schema.Boolean,
-    errors: Schema.Array(Schema.Struct({ code: Schema.Number, message: Schema.String })),
-    result: Schema.NullOr(result),
-    result_info: Schema.optionalKey(Schema.Struct({ total_pages: Schema.optionalKey(Schema.Int) })),
-  });
-
-const Stores = ApiEnvelope(Schema.Array(Schema.Struct({ id: Schema.String, name: Schema.String })));
-
-const Secret = Schema.Struct({
-  id: Schema.String,
-  name: Schema.String,
-  comment: Schema.optionalKey(Schema.NullOr(Schema.String)),
-});
-
-const Secrets = ApiEnvelope(Schema.Array(Secret));
-
-const PENDING_COMMENT = "SimpleFIN access URL for the simplefin-bridge Worker: claim pending.";
-
-const CLAIMED_COMMENT =
-  "SimpleFIN access URL for the simplefin-bridge Worker. Written by scripts/claim.ts.";
+const USAGE = "Usage: pnpm claim [--stdin | --replace | --forget | --bootstrap]";
 
 const DISABLE_ADVICE =
   "The setup token was spent, but the access URL could not be stored and has been discarded. " +
   "Disable this app's connection at https://bridge.simplefin.org, create a new setup token, and run the claim again.";
-
-const Anything = ApiEnvelope(Schema.Unknown);
-
-/** Bodies this script sends to the Secrets Store API. */
-type SecretsRequest =
-  | ReadonlyArray<{
-      readonly name: string;
-      readonly value: string;
-      readonly scopes: ReadonlyArray<"workers">;
-      readonly comment: string;
-    }>
-  | { readonly value?: string; readonly comment: string };
-
-/** A failure safe to print: it never contains a token, URL credential, or response body. */
-class ClaimStopped extends Error {}
 
 function readHidden(prompt: string): Promise<string> {
   const input = process.stdin;
@@ -121,45 +95,12 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** Minimal Cloudflare API client scoped to the account's Secrets Store. */
-function cloudflare(token: Redacted.Redacted<string>, accountId: string) {
-  const call = async <S extends Schema.Top & { readonly DecodingServices: never }>(
-    schema: S,
-    method: string,
-    path: string,
-    body: SecretsRequest | null = null,
-  ): Promise<S["Type"]> => {
-    const headers = new Headers({ authorization: `Bearer ${Redacted.value(token)}` });
-
-    if (body !== null) headers.set("content-type", "application/json");
-
-    const response = await fetch(`${API}/accounts/${accountId}${path}`, {
-      method,
-      redirect: "manual",
-      headers,
-      body: body === null ? null : JSON.stringify(body),
-    });
-
-    const decoded = Schema.decodeUnknownExit(Schema.fromJsonString(schema))(await response.text());
-
-    if (Exit.isFailure(decoded)) {
-      throw new ClaimStopped(
-        `Cloudflare API ${method} ${path.split("/secrets/")[0]} returned HTTP ${response.status}.`,
-      );
-    }
-
-    return decoded.value;
-  };
-
-  return { call };
-}
-
 async function main(): Promise<void> {
   const args = new Set(process.argv.slice(2));
-  const known = new Set(["--stdin", "--replace", "--forget"]);
-  const unknown = [...args].filter((arg) => !known.has(arg));
+  const known = new Set(["--stdin", "--replace", "--forget", "--bootstrap"]);
 
-  if (unknown.length > 0) throw new ClaimStopped(`Unknown option ${unknown.join(" ")}.`);
+  // Never echo arguments: a setup token pasted on the command line would end up in the output.
+  if ([...args].some((arg) => !known.has(arg))) throw new ClaimStopped(`Unknown option. ${USAGE}`);
 
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID ?? "";
 
@@ -171,38 +112,23 @@ async function main(): Promise<void> {
       (await readHidden("Cloudflare API token (Secrets Store Edit; input hidden): ")),
   );
 
-  const api = cloudflare(token, accountId);
+  const api = secretsStoreApi(token, accountId);
+
+  if (args.has("--bootstrap")) {
+    const outcome = await bootstrapAccessUrlSecret(api, process.env.SECRETS_STORE_ID);
+
+    console.log(
+      outcome === "created"
+        ? "Created a placeholder access URL secret, so the Worker can deploy. Claim after deploying."
+        : "The access URL secret already exists; left it unchanged.",
+    );
+
+    return;
+  }
 
   // Check every Cloudflare prerequisite before spending the one-time setup token.
-  const stores = await api.call(Stores, "GET", "/secrets_store/stores");
-
-  const storeId =
-    process.env.SECRETS_STORE_ID ??
-    (stores.result?.length === 1 ? stores.result[0]?.id : undefined);
-
-  if (!stores.success || storeId === undefined) {
-    throw new ClaimStopped(
-      "Could not find exactly one Secrets Store. Set SECRETS_STORE_ID, or check the token's permissions.",
-    );
-  }
-
-  const secrets: Array<typeof Secret.Type> = [];
-
-  for (let page = 1; ; page += 1) {
-    const listed = await api.call(
-      Secrets,
-      "GET",
-      `/secrets_store/stores/${storeId}/secrets?per_page=100&page=${page}`,
-    );
-
-    if (!listed.success) throw new ClaimStopped("The API token cannot list Secrets Store secrets.");
-
-    secrets.push(...(listed.result ?? []));
-
-    if ((listed.result ?? []).length === 0 || page >= (listed.result_info?.total_pages ?? page))
-      break;
-  }
-
+  const storeId = await findStore(api, process.env.SECRETS_STORE_ID, false);
+  const secrets = await listSecrets(api, storeId);
   const existing = secrets.find((secret) => secret.name === ACCESS_URL_SECRET_NAME);
   const pending = existing?.comment === PENDING_COMMENT;
 
@@ -234,35 +160,25 @@ async function main(): Promise<void> {
 
   // Prove the token can write the secret before spending the one-time setup token. A new
   // secret starts as a placeholder the bridge treats as "not connected".
-  const probe =
-    existing === undefined
-      ? await api.call(Secrets, "POST", `/secrets_store/stores/${storeId}/secrets`, [
-          {
-            name: ACCESS_URL_SECRET_NAME,
-            value: ACCESS_URL_PLACEHOLDER,
-            scopes: ["workers"],
-            comment: PENDING_COMMENT,
-          },
-        ])
-      : await api.call(
-          Anything,
-          "PATCH",
-          `/secrets_store/stores/${storeId}/secrets/${existing.id}`,
-          {
-            comment: pending ? PENDING_COMMENT : CLAIMED_COMMENT,
-          },
-        );
+  let secretId: string;
 
-  const secretId =
-    existing?.id ??
-    (Array.isArray(probe.result)
-      ? probe.result.find((secret) => secret.name === ACCESS_URL_SECRET_NAME)?.id
-      : undefined);
-
-  if (!probe.success || secretId === undefined) {
-    throw new ClaimStopped(
-      "The API token cannot write Secrets Store secrets; it needs Secrets Store Edit.",
+  if (existing === undefined) {
+    secretId = await createPlaceholder(api, storeId);
+  } else {
+    const probe = await api.call(
+      Anything,
+      "PATCH",
+      `/secrets_store/stores/${storeId}/secrets/${existing.id}`,
+      { comment: pending ? PENDING_COMMENT : CLAIMED_COMMENT },
     );
+
+    if (!probe.success) {
+      throw new ClaimStopped(
+        "The API token cannot write Secrets Store secrets; it needs Secrets Store Edit.",
+      );
+    }
+
+    secretId = existing.id;
   }
 
   const setupToken = args.has("--stdin")

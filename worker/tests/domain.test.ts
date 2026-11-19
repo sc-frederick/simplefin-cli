@@ -4,9 +4,15 @@ import { describe, expect, test } from "vite-plus/test";
 import { calendarFor, DAY } from "../src/domain/dates.ts";
 import { merchantKey } from "../src/domain/merchants.ts";
 import { formatCents, parseAmountCents } from "../src/domain/money.ts";
-import { planWindows, WINDOW_DAYS } from "../src/domain/sync-plan.ts";
+import {
+  MAX_RETRY_WINDOWS,
+  planWindows,
+  retryWindows,
+  subtractWindow,
+  WINDOW_DAYS,
+} from "../src/domain/sync-plan.ts";
 import { sanitizeText } from "../src/domain/text.ts";
-import { parseAccountSet } from "../src/simplefin/account-set.ts";
+import { displayId, parseAccountSet } from "../src/simplefin/account-set.ts";
 import { decodeSetupToken, parseAccessUrl } from "../src/simplefin/credentials.ts";
 import { TIME_ZONE } from "./support/ledger-harness.ts";
 
@@ -80,6 +86,28 @@ describe("sync windows", () => {
     );
     // Without a complete sync, fetch one window rather than repeating the backfill.
     expect(planWindows(now, { lastSuccess: now - 3600, lastComplete: null }, 365)).toHaveLength(1);
+  });
+
+  test("incomplete windows are re-fetched newest first, around what is already planned", () => {
+    const backfill = { start: now - 365 * DAY, end: now + DAY };
+    const later = now + 12 * 3600;
+    const planned = planWindows(later, { lastSuccess: now, lastComplete: null }, 365);
+    const retries = retryWindows([backfill], planned, MAX_RETRY_WINDOWS);
+
+    expect(planned).toHaveLength(1);
+    expect(retries).toHaveLength(MAX_RETRY_WINDOWS);
+    // The first retry starts where the planned window ends, and none overlap.
+    expect(retries[0]?.end).toBe(planned[0]?.start);
+    expect(retries.every((window) => window.end - window.start <= WINDOW_DAYS * DAY)).toBe(true);
+    expect(retries.at(-1)?.start).toBe((planned[0]?.start ?? 0) - 4 * WINDOW_DAYS * DAY);
+    // Everything the backfill missed is eventually requested, in at most 45-day windows.
+    expect(retryWindows([backfill], planned, Number.POSITIVE_INFINITY)).toHaveLength(8);
+    expect(retryWindows([backfill], planned, -3)).toEqual([]);
+    expect(subtractWindow([backfill], backfill)).toEqual([]);
+    expect(subtractWindow([backfill], { start: now - 10 * DAY, end: now })).toEqual([
+      { start: now - 365 * DAY, end: now - 10 * DAY },
+      { start: now, end: now + DAY },
+    ]);
   });
 });
 
@@ -185,7 +213,7 @@ describe("account set parsing", () => {
       [-150],
     );
     expect(parsed.hasDataErrors).toBe(true);
-    expect(parsed.accountsWithErrors.has("a1")).toBe(true);
+    expect(parsed.accounts[0]?.transactionsComplete).toBe(false);
     expect(parsed.messages).toContain("Reconnect your bank");
     expect(parsed.messages.some((message) => message.includes("2 transaction record(s)"))).toBe(
       true,
@@ -193,7 +221,7 @@ describe("account set parsing", () => {
     expect(parsed.messages.some((message) => message.includes("1 account record(s)"))).toBe(true);
   });
 
-  test("drops impossible timestamps, invalid balances and hidden characters in ids", () => {
+  test("drops impossible timestamps and invalid balances, and cleans ids only for display", () => {
     const hidden = String.fromCodePoint(0xe0041, 0x200b);
 
     const parsed = Result.getOrThrow(
@@ -224,7 +252,10 @@ describe("account set parsing", () => {
 
     const account = parsed.accounts[0];
 
-    expect(account?.id).toBe("acct -1");
+    // The key keeps the upstream id; only what agents see is cleaned.
+    expect(account?.id).toBe(`acct${hidden}-1`);
+    expect(displayId(account?.id ?? "")).toBe("acct -1");
+    expect(account?.name).toBe("acct -1");
     expect(account?.balance).toBeNull();
     expect(account?.availableBalance).toBe("12.50");
     expect(account?.balanceDate).toBeNull();
@@ -236,5 +267,99 @@ describe("account set parsing", () => {
   test("rejects bodies that are not JSON objects", () => {
     expect(Result.isFailure(parseAccountSet("<html>"))).toBe(true);
     expect(Result.isFailure(parseAccountSet('"accounts"'))).toBe(true);
+  });
+
+  test("rejects a body without an accounts array, even when it is valid JSON", () => {
+    for (const body of [{}, { accounts: null }, { errlist: [], errors: [] }, { accounts: {} }]) {
+      expect(Result.isFailure(parseAccountSet(JSON.stringify(body)))).toBe(true);
+    }
+
+    expect(Result.isSuccess(parseAccountSet(JSON.stringify({ accounts: [] })))).toBe(true);
+  });
+
+  test("general Bridge errors make the whole response incomplete", () => {
+    const account = { id: "a1", transactions: [] };
+
+    for (const extra of [
+      { errlist: [{ code: "gen.maintenance", msg: "Try later" }] },
+      { errlist: [{ code: "act.auth", msg: "Reconnect" }] },
+      { errlist: [{ code: 42 }] },
+      { errors: ["Something went wrong"] },
+      { errors: [7] },
+    ]) {
+      const parsed = Result.getOrThrow(
+        parseAccountSet(JSON.stringify({ accounts: [account], ...extra })),
+      );
+
+      expect(parsed.hasDataErrors).toBe(true);
+      expect(parsed.accounts[0]?.transactionsComplete).toBe(false);
+    }
+  });
+
+  test("an account with an unreadable transaction is not complete; its neighbours are", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [
+            {
+              id: "card",
+              transactions: [
+                { id: "p1", posted: 0, amount: "lots", pending: true },
+                { id: "t1", posted: 1_800_000_000, amount: "-1.00" },
+              ],
+            },
+            { id: "checking", transactions: [{ id: "t2", posted: 1_800_000_000, amount: "2" }] },
+            { id: "savings" },
+            { id: "dup", transactions: [] },
+            { id: "dup", transactions: [] },
+          ],
+        }),
+      ),
+    );
+
+    expect(parsed.accounts.map((account) => [account.id, account.transactionsComplete])).toEqual([
+      ["card", false],
+      ["checking", true],
+      ["savings", false],
+      ["dup", false],
+      ["dup", false],
+    ]);
+
+    // Every request asks for transactions, so an account without a list is missing data.
+    const bare = Result.getOrThrow(parseAccountSet(JSON.stringify({ accounts: [{ id: "a1" }] })));
+
+    expect(bare.hasDataErrors).toBe(true);
+  });
+
+  test("ids that differ only past the display limit or in hidden characters stay distinct", () => {
+    const prefix = "t".repeat(300);
+
+    const ids = [`${prefix}-a`, `${prefix}-b`, "zw\u200bid", "zw\u2060id"];
+
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [
+            {
+              id: "a1",
+              transactions: ids.map((id) => ({ id, posted: 1_800_000_000, amount: "-1.00" })),
+            },
+          ],
+        }),
+      ),
+    );
+
+    const stored = parsed.accounts[0]?.transactions?.map((transaction) => transaction.id) ?? [];
+
+    expect(new Set(stored).size).toBe(4);
+    expect(stored).toEqual(ids);
+    // What agents see is still cleaned and bounded, even though two pairs now look alike.
+    expect(stored.map(displayId)).toEqual([
+      `${"t".repeat(255)}…`,
+      `${"t".repeat(255)}…`,
+      "zw id",
+      "zw id",
+    ]);
+    expect(displayId("\u200b")).toBe("(unprintable id)");
   });
 });
