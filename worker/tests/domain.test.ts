@@ -5,6 +5,8 @@ import { calendarFor, DAY } from "../src/domain/dates.ts";
 import { merchantKey } from "../src/domain/merchants.ts";
 import { formatCents, parseAmountCents } from "../src/domain/money.ts";
 import {
+  gapBackoff,
+  gapWindows,
   MAX_RETRY_WINDOWS,
   planWindows,
   retryWindows,
@@ -14,6 +16,7 @@ import {
 import { sanitizeText } from "../src/domain/text.ts";
 import { displayId, parseAccountSet } from "../src/simplefin/account-set.ts";
 import { decodeSetupToken, parseAccessUrl } from "../src/simplefin/credentials.ts";
+import { MIGRATIONS } from "../src/store/migrations.ts";
 import { TIME_ZONE } from "./support/ledger-harness.ts";
 
 describe("merchant names", () => {
@@ -92,22 +95,57 @@ describe("sync windows", () => {
     const backfill = { start: now - 365 * DAY, end: now + DAY };
     const later = now + 12 * 3600;
     const planned = planWindows(later, { lastSuccess: now, lastComplete: null }, 365);
-    const retries = retryWindows([backfill], planned, MAX_RETRY_WINDOWS);
+    const retries = retryWindows([backfill], planned, [], later, MAX_RETRY_WINDOWS);
 
     expect(planned).toHaveLength(1);
     expect(retries).toHaveLength(MAX_RETRY_WINDOWS);
-    // The first retry starts where the planned window ends, and none overlap.
+    // The first retry ends where the planned window starts, and none overlap.
     expect(retries[0]?.end).toBe(planned[0]?.start);
     expect(retries.every((window) => window.end - window.start <= WINDOW_DAYS * DAY)).toBe(true);
-    expect(retries.at(-1)?.start).toBe((planned[0]?.start ?? 0) - 4 * WINDOW_DAYS * DAY);
+    // Windows are counted from the gap's oldest end, so their starts don't move between syncs.
+    expect(retries.map((window) => (window.start - backfill.start) % (WINDOW_DAYS * DAY))).toEqual([
+      0, 0, 0, 0,
+    ]);
     // Everything the backfill missed is eventually requested, in at most 45-day windows.
-    expect(retryWindows([backfill], planned, Number.POSITIVE_INFINITY)).toHaveLength(8);
-    expect(retryWindows([backfill], planned, -3)).toEqual([]);
+    expect(gapWindows([backfill], planned)).toHaveLength(8);
+    expect(retryWindows([backfill], planned, [], later, -3)).toEqual([]);
     expect(subtractWindow([backfill], backfill)).toEqual([]);
     expect(subtractWindow([backfill], { start: now - 10 * DAY, end: now })).toEqual([
       { start: now - 365 * DAY, end: now - 10 * DAY },
       { start: now, end: now + DAY },
     ]);
+  });
+
+  test("retries rotate: least recently tried first, and failing windows back off", () => {
+    const gap = { start: now - 5 * WINDOW_DAYS * DAY, end: now };
+    const windows = gapWindows([gap], []);
+    const starts = windows.map((window) => window.start);
+
+    const failed = (index: number, failures: number, lastAttempt: number) => ({
+      windowStart: starts[index] ?? 0,
+      failures,
+      lastAttempt,
+    });
+
+    expect(windows).toHaveLength(5);
+
+    // The four newest failed an hour ago: the fifth is tried, and they wait out their backoff.
+    const recent = [1, 2, 3, 4].map((index) => failed(index, 1, now - 3600));
+
+    expect(retryWindows([gap], [], recent, now, 4).map((window) => window.start)).toEqual([
+      starts[0],
+    ]);
+
+    // Once they may run again, the one tried longest ago goes first.
+    const due = [failed(1, 1, now - 3 * DAY), failed(2, 1, now - 2 * DAY), failed(0, 1, now - DAY)];
+
+    expect(retryWindows([gap], [], due, now, 3).map((window) => window.start)).toEqual([
+      starts[4],
+      starts[3],
+      starts[1],
+    ]);
+
+    expect([1, 2, 3, 5, 9].map(gapBackoff)).toEqual([DAY, 2 * DAY, 4 * DAY, 16 * DAY, 16 * DAY]);
   });
 });
 
@@ -361,5 +399,74 @@ describe("account set parsing", () => {
       "zw id",
     ]);
     expect(displayId("\u200b")).toBe("(unprintable id)");
+  });
+});
+
+describe("account set parsing with malformed duplicates", () => {
+  const account = (id: string) => ({ id, transactions: [] });
+
+  test("a malformed record blocks pruning for the account whose id it carries", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [account("card"), account("checking"), { id: "card", transactions: "x" }],
+        }),
+      ),
+    );
+
+    expect(parsed.hasDataErrors).toBe(true);
+    expect(parsed.accounts.map((entry) => [entry.id, entry.transactionsComplete])).toEqual([
+      ["card", false],
+      ["checking", true],
+    ]);
+  });
+
+  test("a record whose id can't be read blocks pruning for every account", () => {
+    for (const unreadable of [
+      { id: 42 },
+      { name: "no id" },
+      { id: "" },
+      { id: "x".repeat(513) },
+      "card",
+      null,
+      [],
+    ]) {
+      const parsed = Result.getOrThrow(
+        parseAccountSet(
+          JSON.stringify({ accounts: [account("card"), account("checking"), unreadable] }),
+        ),
+      );
+
+      expect(parsed.hasDataErrors).toBe(true);
+      expect(parsed.accounts.map((entry) => entry.transactionsComplete)).toEqual([false, false]);
+    }
+  });
+
+  test("a connection error blocks pruning for accounts whose connection is unknown", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          errlist: [{ code: "con.auth", msg: "Reconnect", conn_id: "c1" }],
+          accounts: [
+            { id: "a1", conn_id: "c2", transactions: [] },
+            { id: "a2", transactions: [] },
+          ],
+        }),
+      ),
+    );
+
+    expect(parsed.accounts.map((entry) => entry.transactionsComplete)).toEqual([true, false]);
+  });
+});
+
+describe("schema", () => {
+  test("nothing has shipped, so the schema is a single initial migration", () => {
+    expect(MIGRATIONS.map((migration) => migration.id)).toEqual([1]);
+
+    const statements = MIGRATIONS[0]?.statements.join("\n") ?? "";
+
+    expect(statements).toContain("CREATE TABLE sync_gaps");
+    expect(statements).toContain("CREATE TABLE gap_retries");
+    expect(statements).toMatch(/ref TEXT NOT NULL UNIQUE/u);
   });
 });

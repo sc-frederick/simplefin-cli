@@ -4,10 +4,10 @@ import type { SqlError } from "effect/sql/SqlError";
 import { SqlClient } from "effect/sql";
 import type { EpochSeconds } from "../domain/dates.ts";
 import type { LedgerEntry } from "../domain/recurring.ts";
-import type { SyncHistory, SyncWindow } from "../domain/sync-plan.ts";
+import type { GapRetry, SyncHistory, SyncWindow } from "../domain/sync-plan.ts";
 import { mergeWindows, subtractWindow } from "../domain/sync-plan.ts";
-import type { AccountSet } from "../simplefin/account-set.ts";
-import { displayId } from "../simplefin/account-set.ts";
+import type { Account, AccountSet } from "../simplefin/account-set.ts";
+import { accountRef } from "../simplefin/account-set.ts";
 import { migrate } from "./migrations.ts";
 
 /** A storage failure, safe to show: it names the operation, never the data. */
@@ -18,8 +18,8 @@ export class StorageError extends Schema.TaggedError<StorageError>()("StorageErr
 
 /** Transaction query filters, already parsed from tool input. */
 export interface TransactionFilter {
-  /** Restrict to these accounts; `null` means every account. */
-  readonly accountIds: ReadonlyArray<string> | null;
+  /** Restrict to the accounts this names (see {@link LedgerStore}); `null` means every account. */
+  readonly account: string | null;
   readonly since: EpochSeconds | null;
   readonly until: EpochSeconds | null;
   readonly search: string | null;
@@ -31,7 +31,7 @@ export interface TransactionFilter {
 
 /** Period filters shared by cash-flow and merchant rollups. */
 export interface PeriodFilter {
-  readonly accountIds: ReadonlyArray<string> | null;
+  readonly account: string | null;
   readonly since: EpochSeconds | null;
   readonly until: EpochSeconds | null;
 }
@@ -42,6 +42,7 @@ const NullableInt = Schema.NullOr(Schema.Int);
 /** An account row joined with its connection. */
 export const AccountRow = Schema.Struct({
   id: Schema.String,
+  ref: Schema.String,
   name: Schema.String,
   institution: NullableText,
   connection: NullableText,
@@ -58,6 +59,7 @@ export type AccountRow = typeof AccountRow.Type;
 export const TransactionRow = Schema.Struct({
   date: Schema.Int,
   account_id: Schema.String,
+  account_ref: NullableText,
   account_name: NullableText,
   currency: NullableText,
   id: Schema.String,
@@ -120,13 +122,26 @@ const EntryRow = Schema.Struct({
   account: Schema.String,
 });
 
-const AccountNameRow = Schema.Struct({ id: Schema.String, name: Schema.String });
+const IdRow = Schema.Struct({ id: Schema.String });
 const GapRow = Schema.Struct({ window_start: Schema.Int, window_end: Schema.Int });
+
+const GapRetryRow = Schema.Struct({
+  window_start: Schema.Int,
+  failures: Schema.Int,
+  last_attempt: Schema.Int,
+});
+
 const CountRow = Schema.Struct({ n: Schema.Int });
 const ValueRow = Schema.Struct({ value: Schema.NullOr(Schema.Union([Schema.Int, Schema.String])) });
 const EarliestRow = Schema.Struct({ earliest: NullableInt });
 const FinishedRow = Schema.Struct({ finished: NullableInt });
 const InsertedRow = Schema.Struct({ id: Schema.Int });
+
+/**
+ * Most ids one prune statement binds. They go in as one JSON value, and 50 ids of up to 512
+ * characters stay far below SQLite's limit on one value even when every character is escaped.
+ */
+const PRUNE_BATCH = 50;
 
 /** Upsert counts for one stored response. */
 export interface StoredCounts {
@@ -178,21 +193,28 @@ export class LedgerStore extends Context.Service<
     readonly history: Effect.Effect<SyncHistory, StorageError>;
     /** Ranges whose last fetch was incomplete, merged and oldest first. */
     readonly gaps: Effect.Effect<ReadonlyArray<SyncWindow>, StorageError>;
+    /** Retry history of gap windows that are still incomplete. */
+    readonly gapRetries: Effect.Effect<ReadonlyArray<GapRetry>, StorageError>;
+    /**
+     * Record a retry of `window` before sending it, as a failure until a complete response
+     * clears the window. A retry that fails outright then backs off like an incomplete one.
+     */
+    readonly noteGapRetry: (
+      window: SyncWindow,
+      at: EpochSeconds,
+    ) => Effect.Effect<void, StorageError>;
     readonly lastSuccessfulRun: Effect.Effect<SyncRunRow | null, StorageError>;
     readonly lastAttempt: Effect.Effect<SyncRunRow | null, StorageError>;
     readonly counts: Effect.Effect<
       { readonly accounts: number; readonly transactions: number },
       StorageError
     >;
-    readonly resolveAccountIds: (
-      account: string,
-    ) => Effect.Effect<ReadonlyArray<string>, StorageError>;
     readonly accounts: Effect.Effect<ReadonlyArray<AccountRow>, StorageError>;
     readonly transactions: (
       filter: TransactionFilter,
     ) => Effect.Effect<ReadonlyArray<TransactionRow>, StorageError>;
     readonly balanceHistory: (
-      accountIds: ReadonlyArray<string>,
+      account: string,
       since: EpochSeconds,
     ) => Effect.Effect<ReadonlyArray<BalanceRow>, StorageError>;
     readonly cashFlow: (
@@ -239,7 +261,10 @@ export class LedgerStore extends Context.Service<
             ),
           );
 
-      /** Bind a list as one JSON parameter: Durable Object SQLite allows only 100 bound parameters. */
+      /**
+       * Bind a list as one JSON parameter: Durable Object SQLite allows only 100 bound parameters.
+       * Callers keep the list short, since SQLite also caps the size of one bound value.
+       */
       const jsonList = (values: ReadonlyArray<string>) =>
         sql`(SELECT value FROM json_each(${JSON.stringify(values)}))`;
 
@@ -258,7 +283,19 @@ export class LedgerStore extends Context.Service<
           ),
         );
 
+      // Refs are hashed before the transaction opens, so it never waits on anything but SQLite.
       const storeAccountSet = (set: AccountSet, window: SyncWindow) =>
+        Effect.forEach(set.accounts, (account) =>
+          Effect.promise(() => accountRef(account.id)).pipe(
+            Effect.map((ref) => ({ account, ref })),
+          ),
+        ).pipe(Effect.flatMap((accounts) => writeAccountSet(set, accounts, window)));
+
+      const writeAccountSet = (
+        set: AccountSet,
+        accounts: ReadonlyArray<{ readonly account: Account; readonly ref: string }>,
+        window: SyncWindow,
+      ) =>
         Effect.gen(function* () {
           const stamp = yield* now;
           let inserted = 0;
@@ -272,10 +309,10 @@ export class LedgerStore extends Context.Service<
                 org_name = excluded.org_name, org_url = excluded.org_url, updated_at = excluded.updated_at`;
           }
 
-          for (const account of set.accounts) {
+          for (const { account, ref } of accounts) {
             yield* sql`INSERT INTO accounts
-                (id, conn_id, name, currency, balance, available_balance, balance_date, updated_at)
-              VALUES (${account.id}, ${account.connId}, ${account.name}, ${account.currency},
+                (id, ref, conn_id, name, currency, balance, available_balance, balance_date, updated_at)
+              VALUES (${account.id}, ${ref}, ${account.connId}, ${account.name}, ${account.currency},
                 ${account.balance}, ${account.availableBalance}, ${account.balanceDate}, ${stamp})
               ON CONFLICT(id) DO UPDATE SET conn_id = excluded.conn_id, name = excluded.name,
                 currency = excluded.currency, balance = excluded.balance,
@@ -319,13 +356,24 @@ export class LedgerStore extends Context.Service<
             // in the fetched window that the server no longer returns are stale. That holds only
             // when the list is the account's whole list: an unreadable record or a reported error
             // means a missing row proves nothing.
+            // The returned ids can be megabytes together, so they are never bound to a statement:
+            // the stored pending ids are read back and only the stale ones deleted, in batches.
             if (!account.transactionsComplete) continue;
 
-            const seen = account.transactions.map((transaction) => transaction.id);
+            const returned = new Set(account.transactions.map((transaction) => transaction.id));
 
-            yield* sql`DELETE FROM transactions WHERE account_id = ${account.id} AND pending = 1
-              AND ${ownTxDate} >= ${window.start} AND ${ownTxDate} < ${window.end}
-              AND id NOT IN ${jsonList(seen)}`;
+            const pending = yield* sql`SELECT id FROM transactions
+              WHERE account_id = ${account.id} AND pending = 1
+                AND ${ownTxDate} >= ${window.start} AND ${ownTxDate} < ${window.end}`.pipe(
+              Effect.flatMap(decodeRows(IdRow)),
+            );
+
+            const stale = pending.map((row) => row.id).filter((id) => !returned.has(id));
+
+            for (let start = 0; start < stale.length; start += PRUNE_BATCH) {
+              yield* sql`DELETE FROM transactions WHERE account_id = ${account.id}
+                AND id IN ${jsonList(stale.slice(start, start + PRUNE_BATCH))}`;
+            }
           }
 
           const gaps = yield* readGaps;
@@ -339,6 +387,10 @@ export class LedgerStore extends Context.Service<
           for (const gap of next) {
             yield* sql`INSERT INTO sync_gaps (window_start, window_end) VALUES (${gap.start}, ${gap.end})`;
           }
+
+          // Retry history is kept only for windows that are still part of a gap.
+          yield* sql`DELETE FROM gap_retries WHERE NOT EXISTS (SELECT 1 FROM sync_gaps g
+            WHERE g.window_start <= gap_retries.window_start AND gap_retries.window_start < g.window_end)`;
 
           return { new: inserted, updated };
         }).pipe(sql.withTransaction, guard("storeAccountSet"));
@@ -368,11 +420,23 @@ export class LedgerStore extends Context.Service<
           : sql`SELECT * FROM sync_runs ORDER BY started_at DESC, id DESC LIMIT 1`
         ).pipe(Effect.flatMap(decodeRows(SyncRunRow)), Effect.map(firstOrNull));
 
-      const accountFilter = (accountIds: ReadonlyArray<string> | null) =>
-        accountIds === null ? sql.literal("1=1") : sql`t.account_id IN ${jsonList(accountIds)}`;
+      /**
+       * The upstream ids of the accounts `account` names: the account with that ref, else the
+       * account with that upstream id, else every account whose name contains it (ASCII case is
+       * ignored, as in the upstream CLI). Matching happens in SQL, so nothing grows with the
+       * number of accounts.
+       */
+      const namedAccounts = (account: string) =>
+        sql`(SELECT id FROM accounts WHERE CASE
+          WHEN EXISTS (SELECT 1 FROM accounts WHERE ref = ${account}) THEN ref = ${account}
+          WHEN EXISTS (SELECT 1 FROM accounts WHERE id = ${account}) THEN id = ${account}
+          ELSE instr(lower(name), lower(${account})) > 0 END)`;
+
+      const accountFilter = (account: string | null) =>
+        account === null ? sql.literal("1=1") : sql`t.account_id IN ${namedAccounts(account)}`;
 
       const periodClauses = (filter: PeriodFilter) => [
-        accountFilter(filter.accountIds),
+        accountFilter(filter.account),
         filter.since === null ? sql.literal("1=1") : sql`${txDate} >= ${filter.since}`,
         filter.until === null ? sql.literal("1=1") : sql`${txDate} < ${filter.until}`,
       ];
@@ -486,6 +550,24 @@ export class LedgerStore extends Context.Service<
 
         gaps: readGaps.pipe(guard("gaps")),
 
+        gapRetries: sql`SELECT window_start, failures, last_attempt FROM gap_retries`.pipe(
+          Effect.flatMap(decodeRows(GapRetryRow)),
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              windowStart: row.window_start,
+              failures: row.failures,
+              lastAttempt: row.last_attempt,
+            })),
+          ),
+          guard("gapRetries"),
+        ),
+
+        noteGapRetry: (window, at) =>
+          sql`INSERT INTO gap_retries (window_start, failures, last_attempt)
+            VALUES (${window.start}, 1, ${at})
+            ON CONFLICT(window_start) DO UPDATE SET failures = failures + 1,
+              last_attempt = excluded.last_attempt`.pipe(Effect.asVoid, guard("noteGapRetry")),
+
         lastSuccessfulRun: lastRun("ok").pipe(guard("lastSuccessfulRun")),
         lastAttempt: lastRun("any").pipe(guard("lastAttempt")),
 
@@ -501,27 +583,8 @@ export class LedgerStore extends Context.Service<
           return { accounts: accounts[0]?.n ?? 0, transactions: transactions[0]?.n ?? 0 };
         }).pipe(guard("counts")),
 
-        // Matched in code: agents see ids only in their display form, which SQL can't compute.
-        resolveAccountIds: (account) => {
-          const needle = account.toLowerCase();
-
-          return sql`SELECT id, name FROM accounts`.pipe(
-            Effect.flatMap(decodeRows(AccountNameRow)),
-            Effect.map((rows) =>
-              rows.flatMap((row) =>
-                row.id === account ||
-                displayId(row.id) === account ||
-                row.name.toLowerCase().includes(needle)
-                  ? [row.id]
-                  : [],
-              ),
-            ),
-            guard("resolveAccountIds"),
-          );
-        },
-
         accounts:
-          sql`SELECT a.id, a.name, a.currency, a.balance, a.available_balance, a.balance_date,
+          sql`SELECT a.id, a.ref, a.name, a.currency, a.balance, a.available_balance, a.balance_date,
               c.name AS connection, COALESCE(c.org_name, c.org_url) AS institution
             FROM accounts a LEFT JOIN connections c ON c.conn_id = a.conn_id
             ORDER BY institution, a.name`.pipe(
@@ -551,7 +614,7 @@ export class LedgerStore extends Context.Service<
               : sql`t.pending = ${filter.pending ? 1 : 0}`,
           ];
 
-          return sql`SELECT ${txDate} AS date, t.account_id, a.name AS account_name, a.currency, t.id,
+          return sql`SELECT ${txDate} AS date, t.account_id, a.ref AS account_ref, a.name AS account_name, a.currency, t.id,
                 t.amount, t.description, t.payee, t.memo, t.pending
               FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id
               WHERE ${sql.and(clauses)}
@@ -561,10 +624,10 @@ export class LedgerStore extends Context.Service<
           );
         },
 
-        balanceHistory: (accountIds, since) =>
+        balanceHistory: (account, since) =>
           sql`SELECT a.name, s.balance_date, s.balance, s.available_balance
               FROM balance_snapshots s JOIN accounts a ON a.id = s.account_id
-              WHERE s.account_id IN ${jsonList(accountIds)} AND s.balance_date >= ${since}
+              WHERE s.account_id IN ${namedAccounts(account)} AND s.balance_date >= ${since}
               ORDER BY s.balance_date DESC LIMIT 1000`.pipe(
             Effect.flatMap(decodeRows(BalanceRow)),
             guard("balanceHistory"),

@@ -36,7 +36,29 @@ export interface FakeBridge {
    * Bridge-level error entries added to every response. Like the real Bridge, an account with an
    * act.* entry comes back without its transactions.
    */
-  errlist: Array<{ readonly code: string; readonly msg: string; readonly account_id?: string }>;
+  errlist: Array<BridgeError>;
+  /** Extra error entries for one request window, on top of {@link errlist}. */
+  windowErrors: (start: number, end: number) => Array<BridgeError>;
+  /** The accounts every response lists. */
+  accounts: Array<FakeAccount>;
+  /** Raw records appended to every response's account list, unchecked. */
+  extraAccounts: Array<unknown>;
+}
+
+/** One Bridge errlist entry. */
+export interface BridgeError {
+  readonly code: string;
+  readonly msg: string;
+  readonly account_id?: string;
+}
+
+/** One account the fake Bridge lists. */
+export interface FakeAccount {
+  readonly id: string;
+  readonly conn_id: string;
+  readonly name: string;
+  readonly currency: string;
+  readonly balance: string;
 }
 
 const DAY = 86_400;
@@ -106,7 +128,7 @@ export function sampleTransactions(now: number): Array<FakeTransaction> {
   return transactions;
 }
 
-const ACCOUNTS = [
+const ACCOUNTS: ReadonlyArray<FakeAccount> = [
   {
     id: "checking-1",
     conn_id: "conn-bank",
@@ -121,7 +143,7 @@ const ACCOUNTS = [
     currency: "USD",
     balance: "-512.40",
   },
-] as const;
+];
 
 /**
  * Build a fake Bridge serving `transactions` within each requested window. Pending transactions
@@ -136,6 +158,9 @@ export function makeFakeBridge(
     transactions,
     failure: null,
     errlist: [],
+    windowErrors: () => [],
+    accounts: [...ACCOUNTS],
+    extraAccounts: [],
     fetch: async (input, init) => {
       const url = new URL(input);
       const headers = new Headers(init.headers);
@@ -159,15 +184,17 @@ export function makeFakeBridge(
       const start = Number(url.searchParams.get("start-date"));
       const end = Number(url.searchParams.get("end-date"));
 
+      const errlist = [...bridge.errlist, ...bridge.windowErrors(start, end)];
+
       const failing = new Set(
-        bridge.errlist.flatMap((error) =>
+        errlist.flatMap((error) =>
           error.code.startsWith("act.") && error.account_id !== undefined ? [error.account_id] : [],
         ),
       );
 
       const body = {
         errors: [],
-        errlist: bridge.errlist,
+        errlist,
         connections: [
           {
             conn_id: "conn-bank",
@@ -184,29 +211,32 @@ export function makeFakeBridge(
             org_url: "https://card.example",
           },
         ],
-        accounts: ACCOUNTS.map((account) => ({
-          ...account,
-          "available-balance": account.balance,
-          "balance-date": pendingAt,
-          transactions: bridge.transactions
-            .filter((transaction) => transaction.accountId === account.id)
-            .filter(() => !failing.has(account.id))
-            .filter((transaction) => {
-              const at = transaction.pending === true ? pendingAt : transaction.posted;
+        accounts: [
+          ...bridge.accounts.map((account) => ({
+            ...account,
+            "available-balance": account.balance,
+            "balance-date": pendingAt,
+            transactions: bridge.transactions
+              .filter((transaction) => transaction.accountId === account.id)
+              .filter(() => !failing.has(account.id))
+              .filter((transaction) => {
+                const at = transaction.pending === true ? pendingAt : transaction.posted;
 
-              return at >= start && at < end;
-            })
-            .map((transaction) => ({
-              id: transaction.id,
-              posted: transaction.posted,
-              transacted_at: transaction.pending === true ? pendingAt : transaction.posted,
-              amount: transaction.amount,
-              description: transaction.description,
-              payee: transaction.payee ?? null,
-              memo: null,
-              pending: transaction.pending === true,
-            })),
-        })),
+                return at >= start && at < end;
+              })
+              .map((transaction) => ({
+                id: transaction.id,
+                posted: transaction.posted,
+                transacted_at: transaction.pending === true ? pendingAt : transaction.posted,
+                amount: transaction.amount,
+                description: transaction.description,
+                payee: transaction.payee ?? null,
+                memo: null,
+                pending: transaction.pending === true,
+              })),
+          })),
+          ...bridge.extraAccounts,
+        ],
       };
 
       return Response.json(body);

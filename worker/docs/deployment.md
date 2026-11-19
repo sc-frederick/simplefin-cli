@@ -6,12 +6,12 @@ ledger, and a staging copy of bank data would double the exposure for no benefit
 
 Secrets never go through this repository, chat, CI, or Alchemy state:
 
-| Secret                      | Created by                          | Stored in                                |
-| --------------------------- | ----------------------------------- | ---------------------------------------- |
-| Access service token secret | You, in the Zero Trust dashboard    | Executor's account form, pasted directly |
-| SimpleFIN setup token       | You, at bridge.simplefin.org        | Nowhere; `pnpm claim` spends it          |
-| SimpleFIN access URL        | `pnpm bootstrap`, then `pnpm claim` | Cloudflare Secrets Store                 |
-| Cloudflare API tokens       | You                                 | Your shell or an Alchemy profile         |
+| Secret                      | Created by                                   | Stored in                                |
+| --------------------------- | -------------------------------------------- | ---------------------------------------- |
+| Access service token secret | You, in the Zero Trust dashboard             | Executor's account form, pasted directly |
+| SimpleFIN setup token       | You, at bridge.simplefin.org                 | Nowhere; `pnpm --silent claim` spends it |
+| SimpleFIN access URL        | `pnpm bootstrap`, then `pnpm --silent claim` | Cloudflare Secrets Store                 |
+| Cloudflare API tokens       | You                                          | Your shell or an Alchemy profile         |
 
 ## 1. Access team settings
 
@@ -63,7 +63,7 @@ deploy, create a placeholder:
 
 ```sh
 export CLOUDFLARE_ACCOUNT_ID=<account id>
-pnpm bootstrap   # prompts for a Secrets Store–only API token (hidden), as pnpm claim does
+pnpm bootstrap   # prompts for a Secrets Store–only API token (hidden), as pnpm --silent claim does
 ```
 
 It creates the account's Secrets Store if there is none, then the secret holding the value
@@ -113,12 +113,14 @@ first.
 
    ```sh
    export CLOUDFLARE_ACCOUNT_ID=<account id>
-   pnpm claim      # prompts for a Secrets Store–only API token, then the setup token; both hidden
+   pnpm --silent claim      # prompts for a Secrets Store–only API token, then the setup token; both hidden
    ```
 
+   Keep `--silent`: without it pnpm echoes the command line, including a setup token pasted
+   after it by mistake. (`pnpm -s` doesn't hide that line in pnpm 12.)
    The API token needs only _Account › Secrets Store › Edit_. Delete it afterwards if you like.
    The claim replaces the placeholder from § 4 without asking for `--replace`.
-   To pipe the setup token from a password manager instead: `op read … | pnpm claim --stdin`.
+   To pipe the setup token from a password manager instead: `op read … | pnpm --silent claim --stdin`.
 
 3. Within the hour, the watchdog cron runs the first sync. To start it now, call `sync_now`
    through Executor and approve it. Check `sync_status` and `list_accounts`.
@@ -129,7 +131,7 @@ the Bridge and create a new one.
 ## Operations
 
 - **Rotate the service token:** create a new token, add its ID to the policy (`EXECUTOR_SERVICE_TOKEN_ID`) and its client ID to `EXECUTOR_CLIENT_ID`, deploy, reconnect the Executor account with the new values, then delete the old token.
-- **Re-claim:** create a new setup token, then `pnpm claim --replace`. The bridge notices the new credential and clears any backoff.
+- **Re-claim:** create a new setup token, then `pnpm --silent claim --replace`. The bridge notices the new credential and clears any backoff.
 - **Logs:** `pnpm exec alchemy logs` shows the Worker's structured events: refusal reasons, sync counts and error tags. It never shows data or credentials.
 - **Revoke everything:** see [security.md](security.md#revoking-everything).
 

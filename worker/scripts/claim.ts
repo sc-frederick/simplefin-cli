@@ -2,11 +2,14 @@
  * Claim a SimpleFIN setup token and store the resulting access URL in Cloudflare Secrets Store,
  * where only the bridge Worker can read it. Run by the owner in a terminal; never by an agent.
  *
- *   pnpm claim             prompt for the setup token (input hidden)
- *   pnpm claim --stdin     read the setup token from stdin, e.g. from a password manager
- *   pnpm claim --replace   replace an access URL stored earlier
- *   pnpm claim --forget    delete the stored access URL
- *   pnpm bootstrap         before the first deploy: create a placeholder secret if none exists
+ *   pnpm --silent claim             prompt for the setup token (input hidden)
+ *   pnpm --silent claim --stdin     read the setup token from stdin, e.g. from a password manager
+ *   pnpm --silent claim --replace   replace an access URL stored earlier
+ *   pnpm --silent claim --forget    delete the stored access URL
+ *   pnpm bootstrap                  before the first deploy: create a placeholder secret if none exists
+ *
+ * `--silent` stops pnpm from echoing the command line, so a token pasted after it by mistake is
+ * never printed. (`pnpm -s` does not do this in pnpm 12.)
  *
  * Needs a Cloudflare API token limited to "Account › Secrets Store › Edit", read from
  * CLOUDFLARE_API_TOKEN or prompted for (hidden), and CLOUDFLARE_ACCOUNT_ID.
@@ -31,7 +34,7 @@ import {
   secretsStoreApi,
 } from "./secrets-store.ts";
 
-const USAGE = "Usage: pnpm claim [--stdin | --replace | --forget | --bootstrap]";
+const USAGE = "Usage: pnpm --silent claim [--stdin | --replace | --forget | --bootstrap]";
 
 const DISABLE_ADVICE =
   "The setup token was spent, but the access URL could not be stored and has been discarded. " +

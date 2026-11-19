@@ -11,6 +11,9 @@ import { BridgeSettings } from "./sync-service.ts";
 
 /** An account as list_accounts returns it. */
 export interface AccountView {
+  /** The handle every account filter accepts: short, and unique per account. */
+  readonly ref: string;
+  /** The upstream id, cleaned for display. Two accounts can share it, so it is not a handle. */
   readonly id: string;
   readonly name: string;
   readonly institution: string | null;
@@ -25,6 +28,7 @@ export interface AccountView {
 export interface TransactionView {
   readonly date: string;
   readonly account: string | null;
+  readonly account_ref: string | null;
   readonly account_id: string;
   readonly id: string;
   readonly amount: string;
@@ -143,10 +147,6 @@ export class LedgerQueries extends Context.Service<
           return Result.isFailure(parsed) ? yield* parsed.failure : parsed.success;
         });
 
-      /** `null` means every account; an empty list means nothing matched. */
-      const resolveAccounts = (account: string | null) =>
-        account === null ? Effect.succeed(null) : store.resolveAccountIds(account);
-
       const formatOptional = (timestamp: EpochSeconds | null) =>
         timestamp === null ? null : calendar.format(timestamp);
 
@@ -154,6 +154,7 @@ export class LedgerQueries extends Context.Service<
         accounts: store.accounts.pipe(
           Effect.map((rows) => ({
             accounts: rows.map((row) => ({
+              ref: row.ref,
               id: displayId(row.id),
               name: row.name,
               institution: row.institution,
@@ -168,12 +169,8 @@ export class LedgerQueries extends Context.Service<
 
         transactions: (input) =>
           Effect.gen(function* () {
-            const accountIds = yield* resolveAccounts(input.account);
-
-            if (accountIds !== null && accountIds.length === 0) return { transactions: [] };
-
             const rows = yield* store.transactions({
-              accountIds,
+              account: input.account,
               since: yield* parseDate(input.since),
               until: yield* parseDate(input.until),
               search: input.search,
@@ -187,6 +184,7 @@ export class LedgerQueries extends Context.Service<
               transactions: rows.map((row) => ({
                 date: calendar.format(row.date),
                 account: row.account_name,
+                account_ref: row.account_ref,
                 account_id: displayId(row.account_id),
                 id: displayId(row.id),
                 amount: row.amount,
@@ -201,12 +199,8 @@ export class LedgerQueries extends Context.Service<
 
         balanceHistory: (input) =>
           Effect.gen(function* () {
-            const accountIds = yield* resolveAccounts(input.account);
-
-            if (accountIds === null || accountIds.length === 0) return { balances: [] };
-
             const rows = yield* store.balanceHistory(
-              accountIds,
+              input.account,
               (yield* parseDate(input.since)) ?? 0,
             );
 
@@ -224,12 +218,8 @@ export class LedgerQueries extends Context.Service<
           Effect.gen(function* () {
             const since = yield* parseDate(input.since);
             const until = yield* parseDate(input.until);
-            const accountIds = yield* resolveAccounts(input.account);
             const period = { since: formatOptional(since), until: formatOptional(until) };
-
-            if (accountIds !== null && accountIds.length === 0) return { ...period, accounts: [] };
-
-            const rows = yield* store.cashFlow({ accountIds, since, until });
+            const rows = yield* store.cashFlow({ account: input.account, since, until });
 
             return {
               ...period,
@@ -246,7 +236,7 @@ export class LedgerQueries extends Context.Service<
         recurring: (input) =>
           Effect.gen(function* () {
             const since = yield* parseDate(input.since);
-            const entries = yield* store.postedEntries({ accountIds: null, since, until: null });
+            const entries = yield* store.postedEntries({ account: null, since, until: null });
 
             return findRecurring(
               entries,
@@ -263,7 +253,7 @@ export class LedgerQueries extends Context.Service<
           Effect.gen(function* () {
             const since = yield* parseDate(input.since);
             const until = yield* parseDate(input.until);
-            const entries = yield* store.postedEntries({ accountIds: null, since, until });
+            const entries = yield* store.postedEntries({ account: null, since, until });
 
             return {
               since: formatOptional(since),

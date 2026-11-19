@@ -113,7 +113,7 @@ function tool<P extends Schema.Top & { readonly DecodingServices: never }>(spec:
 }
 
 const AccountRef = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)).annotate({
-  description: "Account id or part of its name",
+  description: "Account ref from list_accounts (acct_…), or part of the account's name",
 });
 
 const DateFilter = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(40)).annotate({
@@ -180,7 +180,8 @@ const sinceOrDefault = (since: string | null | undefined) => (since === undefine
 export const TOOLS: ReadonlyArray<RegisteredTool> = [
   tool({
     name: "list_accounts",
-    description: "List every synced account with institution, current balance and balance date.",
+    description:
+      "List every synced account with institution, current balance and balance date. Pass an account's ref to other tools to pick exactly that account; id is for display only.",
     parameters: NoParameters,
     annotations: { title: "List accounts", ...READ_ONLY },
     run: () => LedgerQueries.use((queries) => queries.accounts),
@@ -188,7 +189,7 @@ export const TOOLS: ReadonlyArray<RegisteredTool> = [
   tool({
     name: "list_transactions",
     description:
-      'List transactions, newest first. account: account id or part of its name. since/until: YYYY-MM-DD or e.g. "90d" (since defaults to 30d; null means no lower bound). search: matches description, payee or memo. min_amount/max_amount: signed amounts, e.g. max_amount="-100" for charges of $100 or more. pending: only pending (true) or posted (false). limit: 1-1000, default 100.',
+      'List transactions, newest first. account: account ref from list_accounts, or part of its name. since/until: YYYY-MM-DD or e.g. "90d" (since defaults to 30d; null means no lower bound). search: matches description, payee or memo. min_amount/max_amount: signed amounts, e.g. max_amount="-100" for charges of $100 or more. pending: only pending (true) or posted (false). limit: 1-1000, default 100.',
     parameters: ListTransactionsParameters,
     annotations: { title: "List transactions", ...READ_ONLY },
     run: (params) =>
@@ -207,7 +208,8 @@ export const TOOLS: ReadonlyArray<RegisteredTool> = [
   }),
   tool({
     name: "get_balance_history",
-    description: "Balance snapshots recorded at each sync for an account (id or part of its name).",
+    description:
+      "Balance snapshots recorded at each sync for an account (ref from list_accounts, or part of its name).",
     parameters: BalanceHistoryParameters,
     annotations: { title: "Balance history", ...READ_ONLY },
     run: (params) =>

@@ -267,3 +267,56 @@ describe("invalid Bridge responses", () => {
     }
   }, 60_000);
 });
+
+describe("large responses", () => {
+  test("thousands of 512-character ids sync and prune on the first try", async () => {
+    // 4,300 ids of 512 characters are over 2 MB together: more than SQLite binds as one value.
+    const longId = (prefix: string, index: number) => `${prefix}-${index}-`.padEnd(512, "x");
+
+    const posted = Array.from({ length: 4300 }, (_, index): FakeTransaction => ({
+      id: longId("posted", index),
+      accountId: "card-1",
+      posted: NOW - 2 * DAY,
+      amount: "-1.00",
+      description: `BULK ${index}`,
+    }));
+
+    const pending = Array.from({ length: 120 }, (_, index): FakeTransaction => ({
+      id: longId("pending", index),
+      accountId: "card-1",
+      posted: 0,
+      amount: "-2.00",
+      description: `HOLD ${index}`,
+      pending: true,
+    }));
+
+    const bridge = makeFakeBridge([...posted, ...pending], NOW - 600);
+    const root = await persistRoot();
+    let miniflare = await start(bridge, "0", root, true);
+
+    const pendingCount = async () =>
+      (await tool(miniflare, "list_transactions", { since: null, pending: true, limit: 1000 }))
+        .transactions.length;
+
+    expect(await tool(miniflare, "sync_now")).toMatchObject({
+      complete: true,
+      transactions_new: 4420,
+    });
+    expect(await pendingCount()).toBe(120);
+
+    await miniflare.dispose();
+
+    // The holds post: every pending row is now stale and is deleted, in more than one batch.
+    bridge.transactions = posted;
+    await ageLedger(root, 2 * HOUR);
+    miniflare = await start(bridge, "0", root, false);
+
+    try {
+      expect(await tool(miniflare, "sync_now")).toMatchObject({ complete: true });
+      expect(await pendingCount()).toBe(0);
+      expect(await tool(miniflare, "sync_status")).toMatchObject({ transactions: 4300 });
+    } finally {
+      await miniflare.dispose();
+    }
+  }, 120_000);
+});

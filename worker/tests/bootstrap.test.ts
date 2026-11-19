@@ -116,17 +116,41 @@ describe("bootstrap before the first deploy", () => {
 });
 
 describe("claim script arguments", () => {
-  test("an unknown argument is refused without being echoed", () => {
-    const token = "aHR0cHM6Ly9icmlkZ2Uuc2ltcGxlZmluLm9yZy9jbGFpbS9zZWNyZXQ";
+  const root = new URL("..", import.meta.url).pathname;
+  const token = "aHR0cHM6Ly9icmlkZ2Uuc2ltcGxlZmluLm9yZy9jbGFpbS9zZWNyZXQ";
 
-    const run = spawnSync(process.execPath, ["scripts/claim.ts", token], {
-      cwd: new URL("..", import.meta.url).pathname,
+  /** Every claim invocation the owner is shown, in docs and in the script's own usage text. */
+  const documented = async () => {
+    const files = ["docs/deployment.md", "docs/security.md", "README.md", "scripts/claim.ts"];
+    const texts = await Promise.all(files.map((file) => readFile(`${root}${file}`, "utf8")));
+
+    return texts.flatMap((text) => [...text.matchAll(/pnpm(?: --?[a-z]+)* claim\b/gu)].map(String));
+  };
+
+  test("the runbook's claim command never echoes a mistyped argument", async () => {
+    const runbook = await readFile(`${root}docs/deployment.md`, "utf8");
+    const command = /^\s*(pnpm(?: --?[a-z]+)* claim)\b/mu.exec(runbook)?.[1];
+
+    expect(command).toBeDefined();
+
+    // Run exactly what the runbook shows, with a setup token pasted after it by mistake.
+    const [program = "", ...args] = (command ?? "").split(" ");
+
+    const run = spawnSync(program, [...args, token], {
+      cwd: root,
       encoding: "utf8",
-      env: { PATH: process.env.PATH ?? "" },
+      env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
     });
 
-    expect(run.status).toBe(1);
+    expect(run.status).not.toBe(0);
     expect(run.stderr).toContain("Unknown option.");
     expect(`${run.stdout}${run.stderr}`).not.toContain(token);
+  });
+
+  test("every documented claim command is the quiet one", async () => {
+    const commands = await documented();
+
+    expect(commands.length).toBeGreaterThan(5);
+    expect(commands.filter((command) => command !== "pnpm --silent claim")).toEqual([]);
   });
 });

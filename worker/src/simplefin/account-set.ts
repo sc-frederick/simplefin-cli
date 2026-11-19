@@ -95,8 +95,9 @@ export interface Account {
   readonly transactions: ReadonlyArray<Transaction> | null;
   /**
    * True when `transactions` is the account's whole list for the window: every record was
-   * readable, the account appeared once, and no error applies to the account, its connection or the
-   * response. Only then may stored pending rows missing from the list be pruned.
+   * readable, no other record in the response carries or might carry this account's id, and no
+   * error applies to the account, its connection or the response. Only then may stored pending
+   * rows missing from the list be pruned.
    */
   readonly transactionsComplete: boolean;
 }
@@ -127,6 +128,12 @@ const decodeTransaction = Schema.decodeUnknownResult(TransactionResponse);
 const decodeError = Schema.decodeUnknownResult(ErrorResponse);
 const decodeMessage = Schema.decodeUnknownResult(Schema.String);
 
+/**
+ * Just the id of an account record, read without decoding the rest of it, so a malformed record
+ * still counts against the account it belongs to.
+ */
+const decodeAccountId = Schema.decodeUnknownResult(Schema.Struct({ id: Identifier }));
+
 /** 2100-01-01. Timestamps outside 1970–2100 are corrupt and would break date rendering. */
 const MAX_TIMESTAMP = 4_102_444_800;
 
@@ -145,6 +152,20 @@ export function displayId(id: string): string {
   const clean = sanitizeText(id, 256);
 
   return clean === "" ? "(unprintable id)" : clean;
+}
+
+/**
+ * The handle agents use to pick an account: "acct_" and the first 16 hex digits of the SHA-256
+ * of its upstream id. Display ids can be too long for tool input or look alike; a ref is short
+ * and, for distinct ids, distinct. The accounts table enforces that, so a collision fails the
+ * sync instead of merging two accounts.
+ */
+export async function accountRef(id: string): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(id)),
+  );
+
+  return `acct_${[...digest.subarray(0, 8)].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 /** A balance as a canonical decimal string, or null when absent or not a decimal amount. */
@@ -229,6 +250,20 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
     });
   }
 
+  // How many records carry each id, malformed ones included. A record without a readable id
+  // could belong to any account, so then no account's list can be trusted to be whole.
+  const recordsPerId = new Map<string, number>();
+  let unidentified = 0;
+
+  for (const raw of envelope.success.accounts) {
+    const record = decodeAccountId(raw);
+
+    if (Result.isFailure(record)) unidentified += 1;
+    else recordsPerId.set(record.success.id, (recordsPerId.get(record.success.id) ?? 0) + 1);
+  }
+
+  const duplicated = [...recordsPerId.values()].filter((count) => count > 1).length;
+
   const accounts: Array<Account> = [];
 
   for (const raw of envelope.success.accounts) {
@@ -303,28 +338,19 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
       availableBalance: decimal(account["available-balance"]),
       balanceDate: timestamp(account["balance-date"]) ?? null,
       transactions,
+      // When in doubt, don't prune: a list that might be partial proves nothing is gone.
       transactionsComplete:
         transactions !== null &&
         unreadable === 0 &&
+        unidentified === 0 &&
+        recordsPerId.get(account.id) === 1 &&
         !hasGeneralErrors &&
         !accountsWithErrors.has(account.id) &&
-        (connId === null || !connectionsWithErrors.has(connId)),
+        (connId === null ? connectionsWithErrors.size === 0 : !connectionsWithErrors.has(connId)),
     });
   }
 
-  // An id listed twice has two lists. Both are stored, but neither alone proves a pending row is
-  // gone, so the account is not pruned.
-  const seen = new Map<string, number>();
-
-  for (const account of accounts) seen.set(account.id, (seen.get(account.id) ?? 0) + 1);
-
-  const duplicated = accounts.filter((account) => (seen.get(account.id) ?? 0) > 1).length;
-
-  const checked = accounts.map((account) =>
-    (seen.get(account.id) ?? 0) > 1 ? { ...account, transactionsComplete: false } : account,
-  );
-
-  if (duplicated > 0) messages.add(`${duplicated} account record(s) shared an id with another.`);
+  if (duplicated > 0) messages.add(`${duplicated} account id(s) appeared in more than one record.`);
 
   if (unreadableErrors > 0)
     messages.add(`${unreadableErrors} Bridge error record(s) could not be read.`);
@@ -343,7 +369,7 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
 
   return Result.succeed({
     connections,
-    accounts: checked,
+    accounts,
     // Skipped records leave a gap, so the window must be fetched again like any reported error.
     hasDataErrors:
       hasGeneralErrors ||

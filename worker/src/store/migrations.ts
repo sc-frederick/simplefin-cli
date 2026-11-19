@@ -2,9 +2,11 @@ import { Clock, Effect, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 
 /**
- * Ordered schema migrations, one statement per entry. Never edit an applied migration; append a
- * new one. Compared with the upstream CLI, raw `extra` payloads and connection `sfin_url`s are
- * not stored: nothing reads them, so keeping them would only widen what a breach exposes.
+ * Ordered schema migrations, one statement per entry. Never edit a migration once a deployed
+ * database has applied it; append a new one. Migration 1 was rewritten in place before the first
+ * deploy, when no database had applied it. Compared with the upstream CLI, raw `extra` payloads
+ * and connection `sfin_url`s are not stored: nothing reads them, so keeping them would only widen
+ * what a breach exposes.
  */
 export const MIGRATIONS: ReadonlyArray<{
   readonly id: number;
@@ -21,8 +23,10 @@ export const MIGRATIONS: ReadonlyArray<{
         org_url TEXT,
         updated_at INTEGER NOT NULL
       )`,
+      // id is the upstream id, unchanged. ref is the short, unique handle tools accept.
       `CREATE TABLE accounts (
         id TEXT PRIMARY KEY,
+        ref TEXT NOT NULL UNIQUE,
         conn_id TEXT,
         name TEXT NOT NULL,
         currency TEXT,
@@ -76,16 +80,17 @@ export const MIGRATIONS: ReadonlyArray<{
         transactions_updated INTEGER,
         errors TEXT
       )`,
-    ],
-  },
-  {
-    id: 2,
-    statements: [
-      // Time ranges whose last fetch was incomplete; every sync re-fetches some until they clear.
+      // Time ranges whose last fetch was incomplete; syncs re-fetch them until they clear.
       `CREATE TABLE sync_gaps (
         window_start INTEGER NOT NULL,
         window_end INTEGER NOT NULL,
         PRIMARY KEY (window_start, window_end)
+      )`,
+      // Retry history of one gap window, keyed by its start, so failing windows back off.
+      `CREATE TABLE gap_retries (
+        window_start INTEGER PRIMARY KEY,
+        failures INTEGER NOT NULL,
+        last_attempt INTEGER NOT NULL
       )`,
     ],
   },

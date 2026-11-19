@@ -22,6 +22,12 @@ export const AUTO_SYNC_RETRY_SECONDS = 3 * 3600;
  */
 export const MAX_RETRY_WINDOWS = 4;
 
+/** Wait before re-fetching a gap window whose last retry failed; it doubles with each failure. */
+export const GAP_BACKOFF_SECONDS = DAY;
+
+/** Longest wait between retries of one gap window. */
+export const MAX_GAP_BACKOFF_SECONDS = 16 * DAY;
+
 /** Backoff after the Bridge revokes access or asks for payment; neither fixes itself. */
 export const BLOCKED_RETRY_SECONDS = DAY;
 
@@ -35,6 +41,14 @@ export const RECENT_ATTEMPT_SECONDS = 600;
 export interface SyncWindow {
   readonly start: EpochSeconds;
   readonly end: EpochSeconds;
+}
+
+/** How retries of one gap window have gone, keyed by the window's start. */
+export interface GapRetry {
+  readonly windowStart: EpochSeconds;
+  /** Retries in a row that failed or came back incomplete. */
+  readonly failures: number;
+  readonly lastAttempt: EpochSeconds;
 }
 
 /** When earlier syncs finished, as recorded in the sync history. */
@@ -117,16 +131,66 @@ export function subtractWindow(
 }
 
 /**
- * Request windows that re-fetch earlier incomplete ranges (`gaps`), newest first: the parts
- * `planned` doesn't already cover, at most `limit` of them. Gaps that don't fit stay recorded
- * for the next sync.
+ * Split one range into request windows of at most {@link WINDOW_DAYS}, counted from its oldest
+ * end. Later syncs trim gap ranges only from the newest end or by whole windows, so a window
+ * keeps its start, and with it its retry history, from one sync to the next.
+ */
+function chunkFromStart(range: SyncWindow): Array<SyncWindow> {
+  const windows: Array<SyncWindow> = [];
+
+  for (let cursor = range.start; cursor < range.end;) {
+    const windowEnd = Math.min(range.end, cursor + WINDOW_DAYS * DAY);
+
+    windows.push({ start: cursor, end: windowEnd });
+    cursor = windowEnd;
+  }
+
+  return windows;
+}
+
+/** Seconds to wait after `failures` failed retries in a row before trying a window again. */
+export function gapBackoff(failures: number): number {
+  return failures <= 0
+    ? 0
+    : Math.min(MAX_GAP_BACKOFF_SECONDS, GAP_BACKOFF_SECONDS * 2 ** (failures - 1));
+}
+
+/**
+ * Every request window needed to re-fetch earlier incomplete ranges (`gaps`) that `planned`
+ * doesn't already cover, oldest first.
+ */
+export function gapWindows(
+  gaps: ReadonlyArray<SyncWindow>,
+  planned: ReadonlyArray<SyncWindow>,
+): Array<SyncWindow> {
+  return planned.reduce(subtractWindow, mergeWindows(gaps)).flatMap(chunkFromStart);
+}
+
+/**
+ * Up to `limit` gap windows to re-fetch at `now`. Windows still backing off after a failed
+ * retry wait; the rest go least recently tried first, never-tried ones before any other and
+ * newest first among equals. So windows that keep failing can't keep older ones waiting. Windows
+ * that don't fit stay recorded for the next sync.
  */
 export function retryWindows(
   gaps: ReadonlyArray<SyncWindow>,
   planned: ReadonlyArray<SyncWindow>,
+  retries: ReadonlyArray<GapRetry>,
+  now: EpochSeconds,
   limit: number,
 ): Array<SyncWindow> {
-  const uncovered = planned.reduce(subtractWindow, mergeWindows(gaps));
+  const history = new Map(retries.map((retry) => [retry.windowStart, retry]));
 
-  return uncovered.toReversed().flatMap(chunk).slice(0, Math.max(0, limit));
+  return gapWindows(gaps, planned)
+    .map((window) => ({ window, retry: history.get(window.start) }))
+    .filter(
+      ({ retry }) => retry === undefined || now >= retry.lastAttempt + gapBackoff(retry.failures),
+    )
+    .toSorted(
+      (a, b) =>
+        (a.retry?.lastAttempt ?? -1) - (b.retry?.lastAttempt ?? -1) ||
+        b.window.start - a.window.start,
+    )
+    .slice(0, Math.max(0, limit))
+    .map(({ window }) => window);
 }

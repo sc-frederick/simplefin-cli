@@ -27,7 +27,7 @@ for the threat model and [docs/deployment.md](docs/deployment.md) for the runboo
 2. Connect Executor and confirm `sync_status` answers with `access_configured: false`
    ([§ 5](docs/deployment.md#5-connect-executor)).
 3. **Only now set up SimpleFIN.** Subscribe at bridge.simplefin.org, connect your banks,
-   create a setup token, and run `pnpm claim` straight away
+   create a setup token, and run `pnpm --silent claim` straight away
    ([§ 6](docs/deployment.md#6-claim-simplefin)). Setup tokens work once, and anyone who claims
    yours first can read your accounts, so don't create one before the bridge can claim it.
 4. The hourly watchdog starts the first sync, which loads 365 days of history in nine
@@ -66,15 +66,15 @@ every 3 hours, a one-day backoff after the Bridge revokes access or asks for pay
 
 ```sh
 pnpm install --frozen-lockfile && pnpm effect:setup
-pnpm verify            # format, lint, types, unit + workerd end-to-end tests
-pnpm test:auth         # just the Access and request-filtering tests
-pnpm executor:check    # type-check the Executor app against its pinned framework
-pnpm bootstrap         # before the first deploy: create the placeholder access URL secret
-pnpm plan              # preview infrastructure changes (needs Cloudflare credentials)
-pnpm deploy            # verify, then deploy stage "production" from a clean checkout
-pnpm claim             # claim a setup token into Secrets Store (owner only, in a terminal)
-pnpm claim --replace   # re-claim after creating a new setup token
-pnpm claim --forget    # delete the stored access URL
+pnpm verify                     # format, lint, types, unit + workerd end-to-end tests
+pnpm test:auth                  # just the Access and request-filtering tests
+pnpm executor:check             # type-check the Executor app against its pinned framework
+pnpm bootstrap                  # before the first deploy: create the placeholder access URL secret
+pnpm plan                       # preview infrastructure changes (needs Cloudflare credentials)
+pnpm deploy                     # verify, then deploy stage "production" from a clean checkout
+pnpm --silent claim             # claim a setup token into Secrets Store (owner only, in a terminal)
+pnpm --silent claim --replace   # re-claim after creating a new setup token
+pnpm --silent claim --forget    # delete the stored access URL
 ```
 
 The toolchain follows Stephen's project-kit web template: pnpm, Vite+, TypeScript 7 checks,

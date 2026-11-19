@@ -12,7 +12,7 @@ Read docs/security.md before changing authentication, logging, the SimpleFIN cli
 alchemy.run.ts. In particular:
 
 - Never ask anyone to paste a setup token, access URL, or Access service token secret into chat.
-  The owner runs `pnpm claim` and pastes service-token values into Executor's own form.
+  The owner runs `pnpm --silent claim` and pastes service-token values into Executor's own form.
 - Never log or return request bodies, headers, financial data, tokens, or URLs. Log event names,
   error tags and counts.
 - Keep authentication before routing in src/edge/handler.ts, and keep every tool except

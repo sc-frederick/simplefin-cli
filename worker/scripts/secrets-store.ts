@@ -1,5 +1,5 @@
 /**
- * The Cloudflare Secrets Store calls shared by `pnpm bootstrap` and `pnpm claim`. Nothing here
+ * The Cloudflare Secrets Store calls shared by `pnpm bootstrap` and `pnpm --silent claim`. Nothing here
  * prints a token, a secret value, or a response body.
  */
 import { Exit, Redacted, Schema } from "effect";

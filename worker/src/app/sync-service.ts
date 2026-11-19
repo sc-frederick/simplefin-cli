@@ -8,6 +8,7 @@ import {
   MAX_RETRY_WINDOWS,
   MIN_MANUAL_SYNC_SECONDS,
   RECENT_ATTEMPT_SECONDS,
+  gapWindows,
   planWindows,
   retryWindows,
 } from "../domain/sync-plan.ts";
@@ -164,10 +165,12 @@ export class SyncService extends Context.Service<
           });
         }
 
-        // Earlier incomplete windows ride along with whatever budget is left.
+        // Earlier incomplete windows ride along with whatever budget is left, in rotation.
         const retries = retryWindows(
           yield* store.gaps,
           planned,
+          yield* store.gapRetries,
+          startedAt,
           Math.min(MAX_RETRY_WINDOWS, DAILY_BUDGET - used - planned.length),
         );
 
@@ -185,7 +188,9 @@ export class SyncService extends Context.Service<
         let complete = true;
 
         const fetched = yield* Effect.gen(function* () {
-          for (const window of windows) {
+          for (const [index, window] of windows.entries()) {
+            if (index >= planned.length) yield* store.noteGapRetry(window, startedAt);
+
             const requestId = yield* store.beginRequest;
 
             const set = yield* fetchAccounts(settings.fetch, credentials, window).pipe(
@@ -212,7 +217,7 @@ export class SyncService extends Context.Service<
         yield* Effect.succeed(fetched);
 
         // The checkpoint that later syncs resume from advances only when nothing is left to retry.
-        const remaining = retryWindows(yield* store.gaps, [], Number.POSITIVE_INFINITY).length;
+        const remaining = gapWindows(yield* store.gaps, []).length;
 
         complete = complete && remaining === 0;
 

@@ -52,7 +52,7 @@ details stay in the logs.
 - Responses are size-bounded (25 MiB), time-bounded, and must be strict UTF-8. Each record is schema-decoded on its own, so one malformed record is skipped and reported instead of stopping the sync.
 - A 200 response without an `accounts` array is an error, not an empty account set. Any Bridge error, general or for one account or connection, or any unreadable record marks the window incomplete. Incomplete windows are recorded and re-fetched by later syncs (at most four extra requests each), and the "resume from" checkpoint advances only when none are left.
 - Stored pending rows missing from a response are pruned only when that account's list is complete: every record readable, the account listed once, and no error for it, its connection or the response.
-- Timestamps outside 1970–2100 and balances that aren't decimal amounts are dropped at ingest. Ids are stored exactly as the Bridge sends them (up to 512 characters), so records whose ids differ only in hidden characters or past any display limit stay distinct. Ids are cleaned like other text only when shown.
+- Timestamps outside 1970–2100 and balances that aren't decimal amounts are dropped at ingest. Ids are stored exactly as the Bridge sends them (up to 512 characters), so records whose ids differ only in hidden characters or past any display limit stay distinct. Ids are cleaned like other text only when shown. Because cleaned ids can be long or look alike, tools pick accounts by `ref` instead: `acct_` plus 16 hex digits of the id's SHA-256, unique in the table, so a collision fails the sync rather than merging accounts.
 
 **5. The access URL is never handled loosely.** Before spending the one-time setup token,
 `scripts/claim.ts` proves its Cloudflare token can write the secret: it writes a placeholder,
@@ -103,6 +103,6 @@ avoids the runtime's immediate retries.
 ## Revoking everything
 
 1. Disable the app's connection at https://bridge.simplefin.org. This kills the access URL at the source.
-2. `pnpm claim --forget` deletes the secret.
+2. `pnpm --silent claim --forget` deletes the secret.
 3. Delete the service token in Zero Trust → Access controls → Service credentials.
 4. `pnpm exec alchemy destroy --stage production` deletes the Worker, the Durable Object and its data, and the Access application.
