@@ -10,6 +10,13 @@ import type { Account, AccountSet } from "../simplefin/account-set.ts";
 import { accountRef } from "../simplefin/account-set.ts";
 import { migrate } from "./migrations.ts";
 
+/**
+ * A name or name filter folded for case-blind matching in any script. toLowerCase() picks final
+ * sigma (ς) for a capital sigma that ends a word, so a fragment like "ΜΙΣ" would lower to "μις"
+ * while the full name holds "μισ…". Folding ς to σ makes both sides agree.
+ */
+export const foldName = (text: string): string => text.toLowerCase().replaceAll("ς", "σ");
+
 /** A storage failure, safe to show: it names the operation, never the data. */
 export class StorageError extends Schema.TaggedError<StorageError>()("StorageError", {
   operation: Schema.String,
@@ -314,7 +321,7 @@ export class LedgerStore extends Context.Service<
                 (id, ref, conn_id, name, name_lower, currency, balance, available_balance, balance_date,
                   updated_at)
               VALUES (${account.id}, ${ref}, ${account.connId}, ${account.name},
-                ${account.name.toLowerCase()}, ${account.currency}, ${account.balance},
+                ${foldName(account.name)}, ${account.currency}, ${account.balance},
                 ${account.availableBalance}, ${account.balanceDate}, ${stamp})
               ON CONFLICT(id) DO UPDATE SET conn_id = excluded.conn_id, name = excluded.name,
                 name_lower = excluded.name_lower, currency = excluded.currency, balance = excluded.balance,
@@ -425,15 +432,15 @@ export class LedgerStore extends Context.Service<
       /**
        * The upstream ids of the accounts `account` names: the account with that ref, else the
        * account with that upstream id, else every account whose name contains it, ignoring case
-       * in any script ("épargne" finds "Épargne"). Both sides are lowercased in JavaScript, since
-       * SQLite's lower() folds only ASCII. Matching happens in SQL, so nothing grows with the
+       * in any script ("épargne" finds "Épargne"). Both sides go through foldName in JavaScript,
+       * since SQLite's lower() folds only ASCII. Matching happens in SQL, so nothing grows with the
        * number of accounts.
        */
       const namedAccounts = (account: string) =>
         sql`(SELECT id FROM accounts WHERE CASE
           WHEN EXISTS (SELECT 1 FROM accounts WHERE ref = ${account}) THEN ref = ${account}
           WHEN EXISTS (SELECT 1 FROM accounts WHERE id = ${account}) THEN id = ${account}
-          ELSE instr(name_lower, ${account.toLowerCase()}) > 0 END)`;
+          ELSE instr(name_lower, ${foldName(account)}) > 0 END)`;
 
       const accountFilter = (account: string | null) =>
         account === null ? sql.literal("1=1") : sql`t.account_id IN ${namedAccounts(account)}`;

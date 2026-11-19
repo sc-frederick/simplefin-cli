@@ -644,6 +644,71 @@ describe("account refs", () => {
     expect(result.upper).toEqual({ ...savings, flow: ["Compte Épargne"] });
   });
 
+  test("a Greek capital fragment that ends mid-word still finds the name", async () => {
+    const bridge = makeFakeBridge([], NOW - 600);
+
+    Object.assign(
+      bridge,
+      accountsNamed([
+        { id: "payroll", name: "ΜΙΣΘΟΔΟΣΙΑ" },
+        { id: "checking", name: "Compte Courant" },
+      ]),
+    );
+
+    const result = await runLedger(
+      { bridge, accessUrl: () => TEST_ACCESS_URL },
+      Effect.gen(function* () {
+        yield* autoSync;
+
+        return {
+          upper: yield* filterEveryWay("ΜΙΣ"),
+          lower: yield* filterEveryWay("μισ"),
+          final: yield* filterEveryWay("μις"),
+        };
+      }),
+    );
+
+    const payroll = {
+      transactions: ["ΜΙΣΘΟΔΟΣΙΑ"],
+      balances: ["ΜΙΣΘΟΔΟΣΙΑ"],
+      flow: ["ΜΙΣΘΟΔΟΣΙΑ"],
+    };
+
+    expect(result.upper).toEqual(payroll);
+    expect(result.lower).toEqual(payroll);
+    expect(result.final).toEqual(payroll);
+  });
+
+  test("a renamed account is found by its new name and not its old one", async () => {
+    const bridge = makeFakeBridge([], NOW - 600);
+
+    Object.assign(bridge, accountsNamed([{ id: "savings", name: "Old Savings" }]));
+
+    const result = await runLedger(
+      { bridge, accessUrl: () => TEST_ACCESS_URL },
+      Effect.gen(function* () {
+        yield* autoSync;
+        const before = yield* filterEveryWay("old");
+
+        Object.assign(bridge, accountsNamed([{ id: "savings", name: "Compte Épargne" }]));
+        // A manual sync is skipped within an hour of the last one.
+        yield* TestClock.adjust("2 hours");
+        yield* manualSync;
+
+        return {
+          before,
+          oldName: yield* filterEveryWay("old"),
+          newName: yield* filterEveryWay("ÉPARGNE"),
+        };
+      }),
+    );
+
+    expect(result.before.balances).toEqual(["Old Savings"]);
+    expect(result.oldName).toEqual({ transactions: [], balances: [], flow: [] });
+    expect(result.newName.balances).toEqual(["Compte Épargne"]);
+    expect(result.newName.flow).toEqual(["Compte Épargne"]);
+  });
+
   test("a ref beats an exact id, and an exact id beats part of a name", async () => {
     const bridge = makeFakeBridge([], NOW - 600);
     const ref = await accountRef("by-ref");
