@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.alchemy/
+.wrangler/
+.vite/
+.local/
+.env
+.env.*
+!.env.example
+coverage/
+*.tsbuildinfo

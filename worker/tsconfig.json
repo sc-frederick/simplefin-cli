@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "lib": ["ES2024", "ESNext.Iterator"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "types": ["@cloudflare/workers-types", "node"],
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnostics": true,
+        "refactors": true,
+        "allowedUnstableApis": ["effect/sql", "@effect/sql-sqlite-do", "@effect/sql-sqlite-node"]
+      }
+    ]
+  },
+  "include": ["src", "tests", "scripts", "*.ts", "tools/lint.ts"],
+  "exclude": ["tools/oxlint", "node_modules", "dist", ".alchemy", ".wrangler"]
+}

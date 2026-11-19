@@ -1,0 +1,5 @@
+{
+  "typescript.preferences.autoImportFileExcludePatterns": ["repos/**", "tools/oxlint/**"],
+  "javascript.preferences.autoImportFileExcludePatterns": ["repos/**", "tools/oxlint/**"],
+  "files.watcherExclude": { "**/repos/**": true }
+}

@@ -1,0 +1,499 @@
+import { inspect } from "node:util";
+import { Redacted, Result } from "effect";
+import { describe, expect, test } from "vite-plus/test";
+import { calendarFor, DAY } from "../src/domain/dates.ts";
+import { merchantKey } from "../src/domain/merchants.ts";
+import { formatCents, parseAmountCents } from "../src/domain/money.ts";
+import {
+  gapBackoff,
+  gapWindows,
+  MAX_RETRY_WINDOWS,
+  planWindows,
+  retryWindows,
+  subtractWindow,
+  WINDOW_DAYS,
+} from "../src/domain/sync-plan.ts";
+import { sanitizeText } from "../src/domain/text.ts";
+import { displayId, parseAccountSet } from "../src/simplefin/account-set.ts";
+import { decodeSetupToken, parseAccessUrl } from "../src/simplefin/credentials.ts";
+import { MIGRATIONS } from "../src/store/migrations.ts";
+import { TIME_ZONE } from "./support/ledger-harness.ts";
+
+describe("merchant names", () => {
+  test("strip processors, store numbers and states like the upstream CLI", () => {
+    expect(merchantKey("PAYPAL *AUTODESK 4029357733 CA")).toBe("AUTODESK");
+    expect(merchantKey("AplPay CHICK-FIL-A #JACKSONVILLE FL")).toBe("CHICK-FIL-A");
+    expect(merchantKey("APPLE.COM/BILL 866-712-7753 CA")).toBe("APPLE.COM");
+    expect(merchantKey("SQ *BLUE BOTTLE COFFEE")).toBe("BLUE BOTTLE COFFEE");
+    expect(merchantKey("   ")).toBe("UNKNOWN");
+  });
+});
+
+describe("money", () => {
+  test("parses decimal strings into cents, rounding half to even", () => {
+    expect(Result.getOrThrow(parseAmountCents("-12.34"))).toBe(-1234);
+    expect(Result.getOrThrow(parseAmountCents("5"))).toBe(500);
+    expect(Result.getOrThrow(parseAmountCents("0.125"))).toBe(12);
+    expect(Result.getOrThrow(parseAmountCents("0.135"))).toBe(14);
+    expect(Result.getOrThrow(parseAmountCents("-0.001"))).toBe(0);
+    expect(Result.isFailure(parseAmountCents("1,000.00"))).toBe(true);
+    expect(Result.isFailure(parseAmountCents("1e9"))).toBe(true);
+  });
+
+  test("formats cents with sign and two decimals", () => {
+    expect(formatCents(-1234)).toBe("-12.34");
+    expect(formatCents(5)).toBe("0.05");
+    expect(formatCents(0)).toBe("0.00");
+  });
+});
+
+describe("calendar", () => {
+  const calendar = calendarFor(TIME_ZONE);
+  const now = Date.UTC(2026, 9, 15, 16) / 1000;
+
+  test("renders timestamps with the zone's offset across DST", () => {
+    expect(calendar.format(Date.UTC(2026, 6, 1, 12) / 1000)).toBe("2026-07-01T08:00:00-04:00");
+    expect(calendar.format(Date.UTC(2026, 11, 1, 12) / 1000)).toBe("2026-12-01T07:00:00-05:00");
+  });
+
+  test("parses calendar dates as local midnight, relative days, and explicit offsets", () => {
+    expect(Result.getOrThrow(calendar.parseFilter("2026-12-01", now))).toBe(
+      Date.UTC(2026, 11, 1, 5) / 1000,
+    );
+    expect(Result.getOrThrow(calendar.parseFilter("30d", now))).toBe(now - 30 * DAY);
+    expect(Result.getOrThrow(calendar.parseFilter("2026-10-01T00:00:00Z", now))).toBe(
+      Date.UTC(2026, 9, 1) / 1000,
+    );
+    expect(Result.isFailure(calendar.parseFilter("2026-02-30", now))).toBe(true);
+    expect(Result.isFailure(calendar.parseFilter("yesterday", now))).toBe(true);
+  });
+});
+
+describe("sync windows", () => {
+  const now = 1_800_000_000;
+
+  test("the first sync backfills the configured history in 45-day windows", () => {
+    const windows = planWindows(now, { lastSuccess: null, lastComplete: null }, 365);
+
+    expect(windows).toHaveLength(Math.ceil((365 + 1) / WINDOW_DAYS));
+    expect(windows[0]?.end).toBe(now + DAY);
+    expect(windows.at(-1)?.start).toBe(now - 365 * DAY);
+  });
+
+  test("routine syncs never reach back more than two windows", () => {
+    expect(
+      planWindows(now, { lastSuccess: now - 3600, lastComplete: now - 3600 }, 365),
+    ).toHaveLength(1);
+    expect(planWindows(now, { lastSuccess: now, lastComplete: now - 400 * DAY }, 365)).toHaveLength(
+      2,
+    );
+    // Without a complete sync, fetch one window rather than repeating the backfill.
+    expect(planWindows(now, { lastSuccess: now - 3600, lastComplete: null }, 365)).toHaveLength(1);
+  });
+
+  test("incomplete windows are re-fetched newest first, around what is already planned", () => {
+    const backfill = { start: now - 365 * DAY, end: now + DAY };
+    const later = now + 12 * 3600;
+    const planned = planWindows(later, { lastSuccess: now, lastComplete: null }, 365);
+    const retries = retryWindows([backfill], planned, [], later, MAX_RETRY_WINDOWS);
+
+    expect(planned).toHaveLength(1);
+    expect(retries).toHaveLength(MAX_RETRY_WINDOWS);
+    // The first retry ends where the planned window starts, and none overlap.
+    expect(retries[0]?.end).toBe(planned[0]?.start);
+    expect(retries.every((window) => window.end - window.start <= WINDOW_DAYS * DAY)).toBe(true);
+    // Windows are counted from the gap's oldest end, so their starts don't move between syncs.
+    expect(retries.map((window) => (window.start - backfill.start) % (WINDOW_DAYS * DAY))).toEqual([
+      0, 0, 0, 0,
+    ]);
+    // Everything the backfill missed is eventually requested, in at most 45-day windows.
+    expect(gapWindows([backfill], planned)).toHaveLength(8);
+    expect(retryWindows([backfill], planned, [], later, -3)).toEqual([]);
+    expect(subtractWindow([backfill], backfill)).toEqual([]);
+    expect(subtractWindow([backfill], { start: now - 10 * DAY, end: now })).toEqual([
+      { start: now - 365 * DAY, end: now - 10 * DAY },
+      { start: now, end: now + DAY },
+    ]);
+  });
+
+  test("retries rotate: least recently tried first, and failing windows back off", () => {
+    const gap = { start: now - 5 * WINDOW_DAYS * DAY, end: now };
+    const windows = gapWindows([gap], []);
+    const starts = windows.map((window) => window.start);
+
+    const failed = (index: number, failures: number, lastAttempt: number) => ({
+      windowStart: starts[index] ?? 0,
+      failures,
+      lastAttempt,
+    });
+
+    expect(windows).toHaveLength(5);
+
+    // The four newest failed an hour ago: the fifth is tried, and they wait out their backoff.
+    const recent = [1, 2, 3, 4].map((index) => failed(index, 1, now - 3600));
+
+    expect(retryWindows([gap], [], recent, now, 4).map((window) => window.start)).toEqual([
+      starts[0],
+    ]);
+
+    // Once they may run again, the one tried longest ago goes first.
+    const due = [failed(1, 1, now - 3 * DAY), failed(2, 1, now - 2 * DAY), failed(0, 1, now - DAY)];
+
+    expect(retryWindows([gap], [], due, now, 3).map((window) => window.start)).toEqual([
+      starts[4],
+      starts[3],
+      starts[1],
+    ]);
+
+    expect([1, 2, 3, 5, 9].map(gapBackoff)).toEqual([DAY, 2 * DAY, 4 * DAY, 16 * DAY, 16 * DAY]);
+  });
+});
+
+describe("credentials", () => {
+  test("setup tokens must decode to an HTTPS claim URL on a SimpleFIN host", () => {
+    const valid = btoa("https://bridge.simplefin.org/simplefin/claim/abc123");
+
+    expect(Result.getOrThrow(decodeSetupToken(`  ${valid}\n`)).href).toBe(
+      "https://bridge.simplefin.org/simplefin/claim/abc123",
+    );
+
+    for (const forged of [
+      btoa("https://attacker.example/simplefin/claim/abc"),
+      btoa("http://bridge.simplefin.org/simplefin/claim/abc"),
+      btoa("https://bridge.simplefin.org:8443/claim"),
+      "not base64 at all!",
+      "",
+    ]) {
+      expect(Result.isFailure(decodeSetupToken(forged))).toBe(true);
+    }
+  });
+
+  test("access URLs split into a credential-free base URL and a redacted header", () => {
+    const parsed = Result.getOrThrow(
+      parseAccessUrl(Redacted.make("https://user:p%40ss@bridge.simplefin.org/simplefin/")),
+    );
+
+    expect(parsed.baseUrl).toBe("https://bridge.simplefin.org/simplefin");
+    expect(Redacted.value(parsed.authorization)).toBe(`Basic ${btoa("user:p@ss")}`);
+    expect(inspect(parsed.authorization)).not.toContain("p@ss");
+    expect(JSON.stringify(parsed)).not.toContain(btoa("user:p@ss"));
+
+    for (const rejected of [
+      "https://bridge.simplefin.org/simplefin",
+      "https://user:pass@evil.example/simplefin",
+      "http://user:pass@bridge.simplefin.org/simplefin",
+      "https://user:pass@bridge.simplefin.org/simplefin?x=1",
+      "https://user:%zz@bridge.simplefin.org/simplefin",
+    ]) {
+      expect(Result.isFailure(parseAccessUrl(Redacted.make(rejected)))).toBe(true);
+    }
+  });
+});
+
+describe("bank text", () => {
+  test("hidden and control characters are removed and length is bounded", () => {
+    const [rightToLeftOverride, bell, zeroWidthSpace] = [0x202e, 0x07, 0x200b].map((code) =>
+      String.fromCodePoint(code),
+    );
+
+    expect(sanitizeText(`PAY${rightToLeftOverride}LAP${bell} ${zeroWidthSpace}ME\n\nNOW`)).toBe(
+      "PAY LAP ME NOW",
+    );
+    expect(sanitizeText("x".repeat(1000))).toHaveLength(300);
+
+    // Unicode tag characters ("ASCII smuggling"), soft hyphens, variation selectors and fillers.
+    const smuggled = String.fromCodePoint(
+      0xe0049,
+      0xe0067,
+      0xe006e,
+      0xad,
+      0xfe0f,
+      0x3164,
+      0x2800,
+      0xe0100,
+    );
+
+    expect(sanitizeText(`Coffee${smuggled}Shop`)).toBe("Coffee Shop");
+    expect(sanitizeText(`Caf\u00e9 ${String.fromCodePoint(0x1f600)}`)).toBe(
+      `Caf\u00e9 ${String.fromCodePoint(0x1f600)}`,
+    );
+  });
+});
+
+describe("account set parsing", () => {
+  test("skips unreadable records, keeps the rest, and flags the window for re-fetch", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          errlist: [{ code: "act.auth", msg: "Reconnect\u0000 your bank", account_id: "a1" }],
+          connections: [{ conn_id: "c1", org_name: "Bank" }],
+          accounts: [
+            {
+              id: "a1",
+              conn_id: "c1",
+              name: "Checking",
+              balance: "10.00",
+              "balance-date": 1_800_000_000,
+              transactions: [
+                { id: "t1", posted: 1_800_000_000, amount: "-1.50", description: "Coffee" },
+                { id: "t2", posted: 1_800_000_000, amount: "lots", description: "Broken" },
+                { posted: 1_800_000_000, amount: "-3.00" },
+              ],
+            },
+            { name: "no id" },
+          ],
+        }),
+      ),
+    );
+
+    expect(parsed.accounts.map((account) => account.id)).toEqual(["a1"]);
+    expect(parsed.accounts[0]?.transactions?.map((transaction) => transaction.amountCents)).toEqual(
+      [-150],
+    );
+    expect(parsed.hasDataErrors).toBe(true);
+    expect(parsed.accounts[0]?.transactionsComplete).toBe(false);
+    expect(parsed.messages).toContain("Reconnect your bank");
+    expect(parsed.messages.some((message) => message.includes("2 transaction record(s)"))).toBe(
+      true,
+    );
+    expect(parsed.messages.some((message) => message.includes("1 account record(s)"))).toBe(true);
+  });
+
+  test("drops impossible timestamps and invalid balances, and cleans ids only for display", () => {
+    const hidden = String.fromCodePoint(0xe0041, 0x200b);
+
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [
+            {
+              id: `acct${hidden}-1`,
+              balance: "lots of money",
+              "available-balance": "12.50",
+              "balance-date": 9e12,
+              transactions: [
+                { id: "far-future", posted: 9e12, amount: "-1.00", description: "x" },
+                { id: "negative", posted: -5, amount: "-1.00", description: "x" },
+                {
+                  id: "fine",
+                  posted: 1_800_000_000,
+                  transacted_at: 9e12,
+                  amount: "-1.00",
+                  description: "x",
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+
+    const account = parsed.accounts[0];
+
+    // The key keeps the upstream id; only what agents see is cleaned.
+    expect(account?.id).toBe(`acct${hidden}-1`);
+    expect(displayId(account?.id ?? "")).toBe("acct -1");
+    expect(account?.name).toBe("acct -1");
+    expect(account?.balance).toBeNull();
+    expect(account?.availableBalance).toBe("12.50");
+    expect(account?.balanceDate).toBeNull();
+    expect(
+      account?.transactions?.map((transaction) => [transaction.id, transaction.transactedAt]),
+    ).toEqual([["fine", null]]);
+  });
+
+  test("rejects bodies that are not JSON objects", () => {
+    expect(Result.isFailure(parseAccountSet("<html>"))).toBe(true);
+    expect(Result.isFailure(parseAccountSet('"accounts"'))).toBe(true);
+  });
+
+  test("rejects a body without an accounts array, even when it is valid JSON", () => {
+    for (const body of [{}, { accounts: null }, { errlist: [], errors: [] }, { accounts: {} }]) {
+      expect(Result.isFailure(parseAccountSet(JSON.stringify(body)))).toBe(true);
+    }
+
+    expect(Result.isSuccess(parseAccountSet(JSON.stringify({ accounts: [] })))).toBe(true);
+  });
+
+  test("general Bridge errors make the whole response incomplete", () => {
+    const account = { id: "a1", transactions: [] };
+
+    for (const extra of [
+      { errlist: [{ code: "gen.maintenance", msg: "Try later" }] },
+      { errlist: [{ code: "act.auth", msg: "Reconnect" }] },
+      { errlist: [{ code: 42 }] },
+      { errors: ["Something went wrong"] },
+      { errors: [7] },
+    ]) {
+      const parsed = Result.getOrThrow(
+        parseAccountSet(JSON.stringify({ accounts: [account], ...extra })),
+      );
+
+      expect(parsed.hasDataErrors).toBe(true);
+      expect(parsed.accounts[0]?.transactionsComplete).toBe(false);
+    }
+  });
+
+  test("an account with an unreadable transaction is not complete; its neighbours are", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [
+            {
+              id: "card",
+              transactions: [
+                { id: "p1", posted: 0, amount: "lots", pending: true },
+                { id: "t1", posted: 1_800_000_000, amount: "-1.00" },
+              ],
+            },
+            { id: "checking", transactions: [{ id: "t2", posted: 1_800_000_000, amount: "2" }] },
+            { id: "savings" },
+            { id: "dup", transactions: [] },
+            { id: "dup", transactions: [] },
+          ],
+        }),
+      ),
+    );
+
+    expect(parsed.accounts.map((account) => [account.id, account.transactionsComplete])).toEqual([
+      ["card", false],
+      ["checking", true],
+      ["savings", false],
+      ["dup", false],
+      ["dup", false],
+    ]);
+
+    // Every request asks for transactions, so an account without a list is missing data.
+    const bare = Result.getOrThrow(parseAccountSet(JSON.stringify({ accounts: [{ id: "a1" }] })));
+
+    expect(bare.hasDataErrors).toBe(true);
+  });
+
+  test("ids that differ only past the display limit or in hidden characters stay distinct", () => {
+    const prefix = "t".repeat(300);
+
+    const ids = [`${prefix}-a`, `${prefix}-b`, "zw\u200bid", "zw\u2060id"];
+
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [
+            {
+              id: "a1",
+              transactions: ids.map((id) => ({ id, posted: 1_800_000_000, amount: "-1.00" })),
+            },
+          ],
+        }),
+      ),
+    );
+
+    const stored = parsed.accounts[0]?.transactions?.map((transaction) => transaction.id) ?? [];
+
+    expect(new Set(stored).size).toBe(4);
+    expect(stored).toEqual(ids);
+    // What agents see is still cleaned and bounded, even though two pairs now look alike.
+    expect(stored.map(displayId)).toEqual([
+      `${"t".repeat(255)}…`,
+      `${"t".repeat(255)}…`,
+      "zw id",
+      "zw id",
+    ]);
+    expect(displayId("\u200b")).toBe("(unprintable id)");
+  });
+});
+
+describe("account set parsing with malformed duplicates", () => {
+  const account = (id: string) => ({ id, transactions: [] });
+
+  test("a malformed record blocks pruning for the account whose id it carries", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({
+          accounts: [account("card"), account("checking"), { id: "card", transactions: "x" }],
+        }),
+      ),
+    );
+
+    expect(parsed.hasDataErrors).toBe(true);
+    expect(parsed.accounts.map((entry) => [entry.id, entry.transactionsComplete])).toEqual([
+      ["card", false],
+      ["checking", true],
+    ]);
+  });
+
+  test("a record whose id can't be read blocks pruning for every account", () => {
+    for (const unreadable of [
+      { id: 42 },
+      { name: "no id" },
+      { id: "" },
+      { id: "x".repeat(513) },
+      "card",
+      null,
+      [],
+    ]) {
+      const parsed = Result.getOrThrow(
+        parseAccountSet(
+          JSON.stringify({ accounts: [account("card"), account("checking"), unreadable] }),
+        ),
+      );
+
+      expect(parsed.hasDataErrors).toBe(true);
+      expect(parsed.accounts.map((entry) => entry.transactionsComplete)).toEqual([false, false]);
+    }
+  });
+
+  test("any Bridge error blocks pruning for every account, whatever it names", () => {
+    const accounts = [
+      { id: "a1", conn_id: "c2", transactions: [] },
+      { id: "a2", org: { id: "c3" }, transactions: [] },
+      { id: "a3", transactions: [] },
+    ];
+
+    for (const extra of [
+      { errlist: [{ code: "con.auth", msg: "Reconnect", conn_id: "c1" }] },
+      { errlist: [{ code: "con.auth", msg: "Reconnect", conn_id: "c3" }] },
+      { errlist: [{ code: "act.sync", msg: "Retry", account_id: "a9" }] },
+      { errlist: [{ code: "act.sync", msg: "Retry", account_id: "a1" }] },
+      { errlist: [{ code: "gen.maintenance" }] },
+      { errlist: ["not an object"] },
+      { errors: ["Something went wrong"] },
+    ]) {
+      const parsed = Result.getOrThrow(parseAccountSet(JSON.stringify({ accounts, ...extra })));
+
+      expect(parsed.hasDataErrors, JSON.stringify(extra)).toBe(true);
+      expect(parsed.accounts.map((entry) => entry.transactionsComplete)).toEqual([
+        false,
+        false,
+        false,
+      ]);
+    }
+
+    const clean = Result.getOrThrow(
+      parseAccountSet(JSON.stringify({ accounts, errlist: [], errors: [] })),
+    );
+
+    expect(clean.accounts.map((entry) => entry.transactionsComplete)).toEqual([true, true, true]);
+  });
+
+  test("an account's org id is not taken as its connection", () => {
+    const parsed = Result.getOrThrow(
+      parseAccountSet(
+        JSON.stringify({ accounts: [{ id: "a1", org: { id: "o1" }, transactions: [] }] }),
+      ),
+    );
+
+    expect(parsed.accounts[0]?.connId).toBeNull();
+  });
+});
+
+describe("schema", () => {
+  test("nothing has shipped, so the schema is a single initial migration", () => {
+    expect(MIGRATIONS.map((migration) => migration.id)).toEqual([1]);
+
+    const statements = MIGRATIONS[0]?.statements.join("\n") ?? "";
+
+    expect(statements).toContain("CREATE TABLE sync_gaps");
+    expect(statements).toContain("CREATE TABLE gap_retries");
+    expect(statements).toMatch(/ref TEXT NOT NULL UNIQUE/u);
+  });
+});
