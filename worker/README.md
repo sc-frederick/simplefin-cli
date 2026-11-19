@@ -37,16 +37,20 @@ for the threat model and [docs/deployment.md](docs/deployment.md) for the runboo
 
 The same eight tools as the CLI's MCP server, with the same names, parameters and defaults.
 
-| Tool                     | What it does                                                                                                        |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `list_accounts`          | Accounts with institution, balance and balance date                                                                 |
-| `list_transactions`      | Newest first. Filters: `account`, `since`/`until`, `search`, `min_amount`/`max_amount`, `pending`, `limit` (1–1000) |
-| `summarize_cash_flow`    | Money in and out per account over a period                                                                          |
-| `get_balance_history`    | Balance recorded at each sync                                                                                       |
-| `find_recurring_charges` | Subscriptions, bills and installment fees that repeat                                                               |
-| `top_merchants`          | Spending by normalized merchant; transfers excluded                                                                 |
-| `sync_status`            | Last sync, requests used today, Bridge errors                                                                       |
-| `sync_now`               | Fetch from SimpleFIN now. The only tool not marked read-only, so Executor asks before running it                    |
+| Tool                     | What it does                                                                                                                                                         |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_accounts`          | Accounts with institution, balance, balance date and `ref`, a short handle (`acct_` and 16 hex digits) that picks exactly one account                                |
+| `list_transactions`      | Newest first. Filters: `account`, `since`/`until`, `search`, `min_amount`/`max_amount`, `pending`, `limit` (1–1000). Each row's `account_ref` is its account's `ref` |
+| `summarize_cash_flow`    | Money in and out per account over a period                                                                                                                           |
+| `get_balance_history`    | Balance recorded at each sync                                                                                                                                        |
+| `find_recurring_charges` | Subscriptions, bills and installment fees that repeat                                                                                                                |
+| `top_merchants`          | Spending by normalized merchant; transfers excluded                                                                                                                  |
+| `sync_status`            | Last sync, requests used today, Bridge errors                                                                                                                        |
+| `sync_now`               | Fetch from SimpleFIN now. The only tool not marked read-only, so Executor asks before running it                                                                     |
+
+`account`, in `list_transactions`, `summarize_cash_flow` and `get_balance_history`, takes an
+account's `ref`, its exact upstream id, or part of its name, tried in that order: the first kind
+that matches any account wins. Name matching ignores case, accented letters included.
 
 Differences from the CLI's MCP server:
 

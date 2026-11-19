@@ -193,6 +193,48 @@ describe("pending transactions", () => {
       await miniflare.dispose();
     }
   }, 60_000);
+
+  test("a connection error keeps an account's pending rows even when it has only an org id", async () => {
+    const transactions = sampleTransactions(NOW);
+    const bridge = makeFakeBridge(transactions, NOW - 600);
+
+    // The card account names its institution but not its connection.
+    bridge.accounts = [
+      ...bridge.accounts.filter((account) => account.id !== "card-1"),
+      {
+        id: "card-1",
+        org: { id: "card" },
+        name: "Rewards Card (9876)",
+        currency: "USD",
+        balance: "-512.40",
+      },
+    ];
+
+    const root = await persistRoot();
+    let miniflare = await start(bridge, "0", root, true);
+
+    expect(await tool(miniflare, "sync_now")).toMatchObject({ complete: true });
+    expect(await transactionIds(miniflare, "PUBLIX")).toEqual(["pending-groceries"]);
+
+    await miniflare.dispose();
+
+    // The card's login needs fixing, and its transaction list comes back empty.
+    bridge.errlist = [{ code: "con.auth", msg: "Reconnect your card", conn_id: "conn-card" }];
+    bridge.transactions = transactions.filter((transaction) => transaction.accountId !== "card-1");
+
+    await ageLedger(root, 2 * HOUR);
+    miniflare = await start(bridge, "0", root, false);
+
+    try {
+      expect(await tool(miniflare, "sync_now")).toMatchObject({
+        complete: false,
+        errors: ["Reconnect your card"],
+      });
+      expect(await transactionIds(miniflare, "PUBLIX")).toEqual(["pending-groceries"]);
+    } finally {
+      await miniflare.dispose();
+    }
+  }, 60_000);
 });
 
 describe("upstream ids", () => {

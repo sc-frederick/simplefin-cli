@@ -31,7 +31,6 @@ const ConnectionResponse = Schema.Struct({
 const AccountResponse = Schema.Struct({
   id: Identifier,
   conn_id: OptionalText,
-  org: Schema.optional(Schema.NullOr(Schema.Struct({ id: OptionalText }))),
   name: OptionalText,
   currency: OptionalText,
   balance: Schema.optional(Schema.NullOr(DecimalValue)),
@@ -51,12 +50,7 @@ const TransactionResponse = Schema.Struct({
   pending: Schema.optional(Schema.NullOr(Schema.Boolean)),
 });
 
-const ErrorResponse = Schema.Struct({
-  code: OptionalText,
-  msg: OptionalText,
-  account_id: OptionalText,
-  conn_id: OptionalText,
-});
+const ErrorResponse = Schema.Struct({ code: OptionalText, msg: OptionalText });
 
 /** A SimpleFIN connection (one institution login). */
 export interface Connection {
@@ -95,9 +89,9 @@ export interface Account {
   readonly transactions: ReadonlyArray<Transaction> | null;
   /**
    * True when `transactions` is the account's whole list for the window: every record was
-   * readable, no other record in the response carries or might carry this account's id, and no
-   * error applies to the account, its connection or the response. Only then may stored pending
-   * rows missing from the list be pruned.
+   * readable, no other record in the response carries or might carry this account's id, and the
+   * response carries no error of any kind. Only then may stored pending rows missing from the
+   * list be pruned.
    */
   readonly transactionsComplete: boolean;
 }
@@ -194,9 +188,8 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
   }
 
   const messages = new Set<string>();
-  const accountsWithErrors = new Set<string>();
-  const connectionsWithErrors = new Set<string>();
-  let hasGeneralErrors = false;
+  // Any error at all, whoever it names, stops pruning for every account in this response.
+  let hasErrors = false;
   let skippedAccounts = 0;
   let skippedTransactions = 0;
   let unreadableErrors = 0;
@@ -205,30 +198,23 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
   for (const raw of envelope.success.errlist ?? []) {
     const decoded = decodeError(raw);
 
-    // An error the bridge can't read could be about any account, so it spoils the whole window.
+    hasErrors = true;
+
     if (Result.isFailure(decoded)) {
       unreadableErrors += 1;
-      hasGeneralErrors = true;
       continue;
     }
 
     const error = decoded.success;
-    const code = error.code ?? "";
-
-    if (code.startsWith("act.") && error.account_id) accountsWithErrors.add(error.account_id);
-    else if (code.startsWith("con.") && error.conn_id) connectionsWithErrors.add(error.conn_id);
-    else hasGeneralErrors = true;
-
     const message = sanitizeText(error.msg || error.code || "Unspecified Bridge error");
 
     if (message !== "") messages.add(message);
   }
 
-  // Version 1 error strings carry no account, so any of them makes the whole response suspect.
   for (const raw of envelope.success.errors ?? []) {
     const decoded = decodeMessage(raw);
 
-    hasGeneralErrors = true;
+    hasErrors = true;
 
     if (Result.isFailure(decoded)) unreadableErrors += 1;
     else if (sanitizeText(decoded.success) !== "") messages.add(sanitizeText(decoded.success));
@@ -275,11 +261,13 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
     }
 
     const account = decoded.success;
-    const rawConnId = account.conn_id ?? account.org?.id ?? null;
+    const rawConnId = account.conn_id;
 
     // A connection id too long to be a key is unusable, like a missing one.
     const connId =
-      rawConnId === null || rawConnId === "" || rawConnId.length > 512 ? null : rawConnId;
+      rawConnId === null || rawConnId === undefined || rawConnId === "" || rawConnId.length > 512
+        ? null
+        : rawConnId;
 
     let transactions: Array<Transaction> | null = null;
     let unreadable = 0;
@@ -344,9 +332,7 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
         unreadable === 0 &&
         unidentified === 0 &&
         recordsPerId.get(account.id) === 1 &&
-        !hasGeneralErrors &&
-        !accountsWithErrors.has(account.id) &&
-        (connId === null ? connectionsWithErrors.size === 0 : !connectionsWithErrors.has(connId)),
+        !hasErrors,
     });
   }
 
@@ -372,12 +358,7 @@ export function parseAccountSet(json: string): Result.Result<AccountSet, Invalid
     accounts,
     // Skipped records leave a gap, so the window must be fetched again like any reported error.
     hasDataErrors:
-      hasGeneralErrors ||
-      accountsWithErrors.size > 0 ||
-      connectionsWithErrors.size > 0 ||
-      skippedAccounts > 0 ||
-      skippedTransactions > 0 ||
-      withoutTransactions > 0,
+      hasErrors || skippedAccounts > 0 || skippedTransactions > 0 || withoutTransactions > 0,
     messages: [...messages],
   });
 }

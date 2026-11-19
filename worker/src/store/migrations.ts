@@ -24,11 +24,14 @@ export const MIGRATIONS: ReadonlyArray<{
         updated_at INTEGER NOT NULL
       )`,
       // id is the upstream id, unchanged. ref is the short, unique handle tools accept.
+      // name_lower is name lowercased by JavaScript's full Unicode rules, for name filters:
+      // SQLite's lower() folds only ASCII letters.
       `CREATE TABLE accounts (
         id TEXT PRIMARY KEY,
         ref TEXT NOT NULL UNIQUE,
         conn_id TEXT,
         name TEXT NOT NULL,
+        name_lower TEXT NOT NULL,
         currency TEXT,
         balance TEXT,
         available_balance TEXT,

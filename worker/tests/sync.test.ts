@@ -3,6 +3,7 @@ import { TestClock } from "effect/testing";
 import { describe, expect, test } from "vite-plus/test";
 import { LedgerQueries } from "../src/app/ledger-queries.ts";
 import { AutoSyncOutcome, SyncService } from "../src/app/sync-service.ts";
+import { accountRef } from "../src/simplefin/account-set.ts";
 import { LedgerStore } from "../src/store/ledger-store.ts";
 import {
   makeFakeBridge,
@@ -567,5 +568,115 @@ describe("account refs", () => {
       expect(lookup?.balances).toEqual([account.name]);
       expect(lookup?.flow).toEqual([account.name]);
     }
+  });
+
+  /** Each account filter's result for `account`, as the names of the accounts it picked. */
+  const filterEveryWay = (account: string) =>
+    Effect.gen(function* () {
+      const queries = yield* LedgerQueries;
+
+      const transactions = yield* queries.transactions({
+        account,
+        since: null,
+        until: null,
+        search: null,
+        minAmount: null,
+        maxAmount: null,
+        pending: null,
+        limit: 100,
+      });
+
+      const balances = yield* queries.balanceHistory({ account, since: null });
+      const flow = yield* queries.cashFlow({ account, since: null, until: null });
+
+      return {
+        transactions: [...new Set(transactions.transactions.map((row) => row.account))],
+        balances: [...new Set(balances.balances.map((row) => row.account))],
+        flow: flow.accounts.map((row) => row.account),
+      };
+    });
+
+  const accountsNamed = (
+    entries: ReadonlyArray<{ readonly id: string; readonly name: string }>,
+  ): Pick<ReturnType<typeof makeFakeBridge>, "accounts" | "transactions"> => ({
+    accounts: entries.map(({ id, name }, index) => ({
+      id,
+      conn_id: "conn-bank",
+      name,
+      currency: "USD",
+      balance: `${index}.00`,
+    })),
+    transactions: entries.map(({ id }, index) => ({
+      id: `t-${index}`,
+      accountId: id,
+      posted: NOW - DAY,
+      amount: `-${index + 1}.00`,
+      description: `CHARGE ${index}`,
+    })),
+  });
+
+  test("name filters ignore case in accented letters too", async () => {
+    const bridge = makeFakeBridge([], NOW - 600);
+
+    Object.assign(
+      bridge,
+      accountsNamed([
+        { id: "savings", name: "Compte Épargne" },
+        { id: "checking", name: "Compte Courant" },
+      ]),
+    );
+
+    const result = await runLedger(
+      { bridge, accessUrl: () => TEST_ACCESS_URL },
+      Effect.gen(function* () {
+        yield* autoSync;
+
+        return {
+          lower: yield* filterEveryWay("épargne"),
+          upper: yield* filterEveryWay("ÉPARGNE"),
+        };
+      }),
+    );
+
+    const savings = { transactions: ["Compte Épargne"], balances: ["Compte Épargne"] };
+
+    expect(result.lower).toEqual({ ...savings, flow: ["Compte Épargne"] });
+    expect(result.upper).toEqual({ ...savings, flow: ["Compte Épargne"] });
+  });
+
+  test("a ref beats an exact id, and an exact id beats part of a name", async () => {
+    const bridge = makeFakeBridge([], NOW - 600);
+    const ref = await accountRef("by-ref");
+
+    // The same text is one account's ref, another's raw id, and part of a third's name.
+    Object.assign(
+      bridge,
+      accountsNamed([
+        { id: "by-ref", name: "Ref Account" },
+        { id: ref, name: "Id Account" },
+        { id: "by-name", name: `Name Account ${ref}` },
+        { id: "plain", name: "Plain by-name Account" },
+      ]),
+    );
+
+    const result = await runLedger(
+      { bridge, accessUrl: () => TEST_ACCESS_URL },
+      Effect.gen(function* () {
+        yield* autoSync;
+
+        return {
+          ref: yield* filterEveryWay(ref),
+          id: yield* filterEveryWay("by-name"),
+          name: yield* filterEveryWay("PLAIN"),
+        };
+      }),
+    );
+
+    const picked = (name: string) => ({ transactions: [name], balances: [name], flow: [name] });
+
+    // The ref is also an id and part of a name; the id "by-name" is also part of a name.
+    expect(result.ref).toEqual(picked("Ref Account"));
+    expect(result.id).toEqual(picked(`Name Account ${ref}`));
+    expect(result.name).toEqual(picked("Plain by-name Account"));
   });
 });

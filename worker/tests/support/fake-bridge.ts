@@ -50,12 +50,15 @@ export interface BridgeError {
   readonly code: string;
   readonly msg: string;
   readonly account_id?: string;
+  readonly conn_id?: string;
 }
 
 /** One account the fake Bridge lists. */
 export interface FakeAccount {
   readonly id: string;
-  readonly conn_id: string;
+  /** Omitted for accounts that name only their institution, through `org`. */
+  readonly conn_id?: string;
+  readonly org?: { readonly id: string };
   readonly name: string;
   readonly currency: string;
   readonly balance: string;

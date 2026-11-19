@@ -442,20 +442,47 @@ describe("account set parsing with malformed duplicates", () => {
     }
   });
 
-  test("a connection error blocks pruning for accounts whose connection is unknown", () => {
+  test("any Bridge error blocks pruning for every account, whatever it names", () => {
+    const accounts = [
+      { id: "a1", conn_id: "c2", transactions: [] },
+      { id: "a2", org: { id: "c3" }, transactions: [] },
+      { id: "a3", transactions: [] },
+    ];
+
+    for (const extra of [
+      { errlist: [{ code: "con.auth", msg: "Reconnect", conn_id: "c1" }] },
+      { errlist: [{ code: "con.auth", msg: "Reconnect", conn_id: "c3" }] },
+      { errlist: [{ code: "act.sync", msg: "Retry", account_id: "a9" }] },
+      { errlist: [{ code: "act.sync", msg: "Retry", account_id: "a1" }] },
+      { errlist: [{ code: "gen.maintenance" }] },
+      { errlist: ["not an object"] },
+      { errors: ["Something went wrong"] },
+    ]) {
+      const parsed = Result.getOrThrow(parseAccountSet(JSON.stringify({ accounts, ...extra })));
+
+      expect(parsed.hasDataErrors, JSON.stringify(extra)).toBe(true);
+      expect(parsed.accounts.map((entry) => entry.transactionsComplete)).toEqual([
+        false,
+        false,
+        false,
+      ]);
+    }
+
+    const clean = Result.getOrThrow(
+      parseAccountSet(JSON.stringify({ accounts, errlist: [], errors: [] })),
+    );
+
+    expect(clean.accounts.map((entry) => entry.transactionsComplete)).toEqual([true, true, true]);
+  });
+
+  test("an account's org id is not taken as its connection", () => {
     const parsed = Result.getOrThrow(
       parseAccountSet(
-        JSON.stringify({
-          errlist: [{ code: "con.auth", msg: "Reconnect", conn_id: "c1" }],
-          accounts: [
-            { id: "a1", conn_id: "c2", transactions: [] },
-            { id: "a2", transactions: [] },
-          ],
-        }),
+        JSON.stringify({ accounts: [{ id: "a1", org: { id: "o1" }, transactions: [] }] }),
       ),
     );
 
-    expect(parsed.accounts.map((entry) => entry.transactionsComplete)).toEqual([true, false]);
+    expect(parsed.accounts[0]?.connId).toBeNull();
   });
 });
 
